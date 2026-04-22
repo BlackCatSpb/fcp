@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# FCP specific
+*.gguf
+*.bin
+*.pt
+*.safetensors
+
+# Models (download separately)
+models/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Colab (download separately)
+colab_upload/fcp_adapter.zip
