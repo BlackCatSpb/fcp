@@ -29,5 +29,10 @@ Thumbs.db
 # Logs
 *.log
 
-# Colab (download separately)
+# Colab
 colab_upload/fcp_adapter.zip
+
+# FMF large files
+fmf/eva_ai/core/hf_cache/
+fmf/eva_ai/memory/fractal_graph_v2/models/
+*.db
