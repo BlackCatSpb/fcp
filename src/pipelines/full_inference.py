@@ -9,11 +9,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("runner")
 
 MODELS = {
-    "openvino": "C:/Users/black/OneDrive/Desktop/Models/openvino_model.xml",
+    "openvino": "C:/Users/black/OneDrive/Desktop/Models/ruadapt_qwen3_4b_openvino_ModelB/openvino_model.xml",
     "tokenizer": "C:/Users/black/OneDrive/Desktop/Models/ruadapt_qwen3_4b_openvino_ModelB",
     "graph": "C:/Users/black/OneDrive/Desktop/FMF_EVA/eva_ai/memory/fractal_graph_v2/fractal_graph_v2_data/fractal_graph.db"
 }
 
+MAX_NEW_TOKENS = 64
 SEQ_LEN = 32
 
 
@@ -43,8 +44,8 @@ class Qwen3Runner:
         self.compiled = self.core.compile_model(self.model, "CPU")
         logger.info("Model ready: logits (1, 32, 146260)")
     
-    def generate(self, prompt: str, use_graph: bool = True) -> str:
-        """Generate response."""
+    def generate(self, prompt: str, use_graph: bool = True, max_new_tokens: int = MAX_NEW_TOKENS) -> str:
+        """Generate full response with autoregressive decoding."""
         
         # Get graph context
         graph_vec = None
@@ -54,38 +55,68 @@ class Qwen3Runner:
         
         # Encode prompt
         input_ids = self.tokenizer.encode(prompt, return_tensors="np")
-        seq_len = min(input_ids.shape[1], SEQ_LEN)
+        input_ids = input_ids[0]  # (seq_len,)
         
-        # Pad or truncate
-        input_ids_padded = np.zeros((1, SEQ_LEN), dtype=np.int64)
-        input_ids_padded[0, :seq_len] = input_ids[0, :seq_len]
+        # Start with prompt tokens
+        generated_ids = list(input_ids)
+        past_key_values = None
         
-        # Attention mask
-        attention_mask = np.zeros((1, SEQ_LEN), dtype=np.int64)
-        attention_mask[0, :seq_len] = 1
+        logger.info(f"Generating {max_new_tokens} new tokens...")
         
-        # Position ids
-        position_ids = np.zeros((1, SEQ_LEN), dtype=np.int64)
-        for i in range(SEQ_LEN):
-            position_ids[0, i] = i
+        for step in range(max_new_tokens):
+            # Prepare input
+            seq_len = min(len(generated_ids), SEQ_LEN)
+            current_input = generated_ids[-seq_len:]
+            
+            # Pad to SEQ_LEN
+            input_ids_padded = np.zeros((1, SEQ_LEN), dtype=np.int64)
+            input_ids_padded[0, :seq_len] = current_input
+            
+            # Attention mask
+            attention_mask = np.zeros((1, SEQ_LEN), dtype=np.int64)
+            attention_mask[0, :seq_len] = 1
+            
+            # Position ids
+            position_ids = np.zeros((1, SEQ_LEN), dtype=np.int64)
+            for i in range(SEQ_LEN):
+                position_ids[0, i] = i
+            
+            beam_idx = np.zeros((1,), dtype=np.int32)
+            
+            # Run inference
+            ireq = self.compiled.create_infer_request()
+            outputs = ireq.infer({
+                "input_ids": input_ids_padded,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "beam_idx": beam_idx
+            })
+            
+            logits = outputs["logits"]  # (1, SEQ_LEN, vocab_size)
+            
+            # Get next token (last position)
+            next_token_logits = logits[0, seq_len-1, :]
+            next_token = int(np.argmax(next_token_logits))
+            
+            # Check for EOS
+            if next_token == self.tokenizer.eos_token_id:
+                logger.info(f"EOS token at step {step}")
+                break
+            
+            generated_ids.append(next_token)
+            
+            if step % 8 == 0:
+                logger.info(f"Step {step}: next_token={next_token}")
         
-        beam_idx = np.zeros((1,), dtype=np.int32)
+        # Decode
+        response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         
-        # Run
-        ireq = self.compiled.create_infer_request()
-        outputs = ireq.infer({
-            "input_ids": input_ids_padded,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "beam_idx": beam_idx
-        })
+        # Remove prompt from response
+        prompt_len = len(self.tokenizer.decode(input_ids, skip_special_tokens=True))
+        if response.startswith(prompt[:len(prompt)]):
+            response = response[len(prompt):].strip()
         
-        logits = outputs["logits"]
-        
-        # Get next token
-        next_token = int(np.argmax(logits[0, seq_len-1, :]))
-        
-        return f"Generated token: {next_token}"
+        return response
 
 
 def test():
@@ -96,12 +127,12 @@ def test():
     runner = Qwen3Runner()
     
     prompts = [
-        "What is artificial intelligence?",
+        "Что такое искусственный интеллект?",
     ]
     
     for p in prompts:
         logger.info(f"\nPrompt: {p}")
-        resp = runner.generate(p, use_graph=True)
+        resp = runner.generate(p, use_graph=True, max_new_tokens=32)
         logger.info(f"Response: {resp}")
 
 
