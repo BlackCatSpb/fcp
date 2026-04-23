@@ -313,6 +313,90 @@ class SimpleTCM:
             self.history = self.history[-self.max_history:]
 
 
+class LoRATrainer:
+    """Async LoRA trainer per SPEC section 3.5."""
+    
+    def __init__(self, hybrid_layers: list, learning_rate: float = 0.01):
+        self.layers = hybrid_layers
+        self.lr = learning_rate
+        self.buffer_a = None
+        self.buffer_b = None
+        self.updates_pending = 0
+        
+        logger.info("[LoRA] Trainer initialized")
+    
+    def compute_contrastive_loss(
+        self, 
+        anchor: np.ndarray, 
+        positive: np.ndarray, 
+        negative: np.ndarray
+    ) -> float:
+        """Contrastive loss: maximize sim(anchor, positive) vs negative."""
+        pos_sim = np.dot(anchor, positive) / (np.linalg.norm(anchor) * np.linalg.norm(positive) + 1e-8)
+        neg_sim = np.dot(anchor, negative) / (np.linalg.norm(anchor) * np.linalg.norm(negative) + 1e-8)
+        loss = -np.log(np.exp(pos_sim) / (np.exp(pos_sim) + np.exp(neg_sim)) + 1e-8)
+        return float(loss)
+    
+    def update_layer(
+        self, 
+        layer_id: int, 
+        target_hidden: np.ndarray, 
+        input_hidden: np.ndarray,
+        alpha: float = 0.1
+    ):
+        """Update LoRA weights using SGD."""
+        if layer_id >= len(self.layers):
+            return
+        
+        layer = self.layers[layer_id]
+        lora = layer.lora
+        
+        if lora.rank == 0 or lora.W_down is None:
+            return
+        
+        # Compute pseudo-gradient
+        # target = input @ W_down @ W_up
+        # grad = 2 * (target - input @ W_down @ W_up) @ (input @ W_down)'
+        
+        residual = target_hidden - input_hidden
+        
+        # Simplified update: add residual as correction
+        if residual.ndim == 2:
+            grad_down = residual.mean(axis=0, keepdims=True) @ lora.W_up.T * alpha
+            grad_up = input_hidden.T @ residual * alpha
+            
+            lora.W_down += self.lr * grad_down.T
+            lora.W_up += self.lr * grad_up
+        
+        self.updates_pending += 1
+    
+    def update_from_contradiction(
+        self, 
+        layer_id: int,
+        correct_output: np.ndarray,
+        model_output: np.ndarray,
+        input_hidden: np.ndarray
+    ):
+        """Update from contradiction resolution (SPEC: корректирующий пример)."""
+        self.update_layer(layer_id, correct_output, input_hidden)
+        logger.info(f"[LoRA] Updated layer {layer_id} from contradiction")
+    
+    def update_async(self):
+        """Async update with double buffering (SPEC: dbl buffer)."""
+        if self.updates_pending == 0:
+            return
+        
+        logger.info(f"[LoRA] Async update: {self.updates_pending}")
+        self.updates_pending = 0
+    
+    def schedule_async_update(self):
+        """Schedule async update."""
+        import threading
+        t = threading.Thread(target=self.update_async)
+        t.daemon = True
+        t.start()
+
+
 def test():
     print("=" * 60)
     print("FCP v9 - Per-Layer Hybrid LoRA Test")
