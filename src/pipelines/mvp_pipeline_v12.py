@@ -283,7 +283,7 @@ class HybridLayerV12:
             graph_vec: for injection
             should_stop: bool
         """
-        # Stage 1-2: GNN clusterer (if graph context)
+        # Stage 1-2: GNN clusterer (if graph context provided)
         graph_vec = None
         if graph_embeddings is not None and len(graph_embeddings) > 0:
             graph_vec = self.gnn.forward(graph_embeddings, edge_index if edge_index is not None else np.array([]))
@@ -293,10 +293,13 @@ class HybridLayerV12:
         
         # Stage 4: Activation gate
         self.confidence = self._compute_confidence(output, graph_vec)
-        should_stop = self.confidence > self.stop_threshold
+        # Higher threshold for early exit
+        should_stop = (self.confidence > self.stop_threshold and 
+                     self.layer_id >= 10 and  # Start checking after layer 10
+                     self.confidence > 0.95)  # Very high confidence
         
-        # Stage 5: Fusion (if at injection layer)
-        if self.layer_id in self.INJECTION_LAYERS and graph_vec is not None:
+        # Stage 5: Fusion (if at injection layer AND graph provided)
+        if self.layer_id in self.INJECTION_LAYERS and graph_embeddings is not None and graph_vec is not None:
             output = self._fuse_streams(output, graph_vec)
         
         # Apply LoRA
@@ -311,15 +314,16 @@ class HybridLayerV12:
         graph_vec: np.ndarray = None
     ) -> float:
         """Compute activation confidence."""
-        # Magnitude-based confidence
+        # Magnitude-based confidence (normalized)
         mag = np.mean(np.linalg.norm(hidden_states, axis=-1))
         
         # Graph contribution
         graph_contrib = 0.0
         if graph_vec is not None:
-            graph_contrib = np.mean(np.linalg.norm(graph_vec)) * 0.1
+            graph_contrib = np.mean(np.linalg.norm(graph_vec)) * 0.05
         
-        confidence = min(1.0, (mag + graph_contrib) / (self.hidden_dim ** 0.5))
+        # Conservative confidence calculation
+        confidence = min(1.0, (mag * 0.01 + graph_contrib) / (self.hidden_dim ** 0.5))
         
         return confidence
     
@@ -333,10 +337,18 @@ class HybridLayerV12:
             return hidden_states
         
         # Get last token
-        last_token = hidden_states[0, -1, :]
+        last_token = hidden_states[0, -1, :].copy()
+        
+        # Handle different graph_vec shapes
+        if graph_vec.ndim > 1:
+            # Take mean of graph embeddings
+            graph_vec = np.mean(graph_vec, axis=0)
+        
+        # Ensure graph_vec has correct size
+        graph_vec = graph_vec[:self.hidden_dim]
         
         # Gated add
-        fused = last_token + self.fusion_weight * graph_vec[:self.hidden_dim]
+        fused = last_token + self.fusion_weight * graph_vec
         
         # Replace last token
         output = hidden_states.copy()
@@ -416,8 +428,10 @@ class FCPLayerStackV12:
                 apply_lora=True
             )
             
-            # Count injection
-            if layer.layer_id in HybridLayerV12.INJECTION_LAYERS:
+            # Count injection only if actually performed
+            if (graph_data is not None and 
+                graph_embeddings is not None and
+                layer.layer_id in HybridLayerV12.INJECTION_LAYERS):
                 self.total_injections += 1
             
             # Early exit
