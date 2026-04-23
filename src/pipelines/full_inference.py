@@ -3,12 +3,14 @@ import sys
 import logging
 import numpy as np
 from openvino import Core
+from transformers import AutoTokenizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("runner")
 
 MODELS = {
     "openvino": "C:/Users/black/OneDrive/Desktop/Models/openvino_model.xml",
+    "tokenizer": "C:/Users/black/OneDrive/Desktop/Models/ruadapt_qwen3_4b_openvino_ModelB",
     "graph": "C:/Users/black/OneDrive/Desktop/FMF_EVA/eva_ai/memory/fractal_graph_v2/fractal_graph_v2_data/fractal_graph.db"
 }
 
@@ -31,6 +33,10 @@ class Qwen3Runner:
     """Full Qwen3 inference with graph injection."""
     
     def __init__(self):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(MODELS["tokenizer"], trust_remote_code=True)
+        logger.info(f"Tokenizer ready: vocab={len(self.tokenizer.get_vocab())}")
+        
         logger.info("Loading OpenVINO model...")
         self.core = Core()
         self.model = self.core.read_model(MODELS["openvino"])
@@ -41,21 +47,24 @@ class Qwen3Runner:
         """Generate response."""
         
         # Get graph context
+        graph_vec = None
         if use_graph:
-            gv = get_graph_vector(prompt)
-            logger.info(f"Graph vector: shape={gv.shape}, norm={np.linalg.norm(gv):.3f}")
+            graph_vec = get_graph_vector(prompt)
+            logger.info(f"Graph vector: shape={graph_vec.shape}, norm={np.linalg.norm(graph_vec):.3f}")
         
-        # Create input (simplified tokenization)
-        input_ids = np.zeros((1, SEQ_LEN), dtype=np.int64)
-        input_ids[0, 0] = 272  # "What"
-        input_ids[0, 1] = 271
-        input_ids[0, 2] = 528
-        input_ids[0, 3] = 271
-        input_ids[0, 4] = 1499  # AI
+        # Encode prompt
+        input_ids = self.tokenizer.encode(prompt, return_tensors="np")
+        seq_len = min(input_ids.shape[1], SEQ_LEN)
         
+        # Pad or truncate
+        input_ids_padded = np.zeros((1, SEQ_LEN), dtype=np.int64)
+        input_ids_padded[0, :seq_len] = input_ids[0, :seq_len]
+        
+        # Attention mask
         attention_mask = np.zeros((1, SEQ_LEN), dtype=np.int64)
-        attention_mask[0, :5] = 1
+        attention_mask[0, :seq_len] = 1
         
+        # Position ids
         position_ids = np.zeros((1, SEQ_LEN), dtype=np.int64)
         for i in range(SEQ_LEN):
             position_ids[0, i] = i
@@ -65,7 +74,7 @@ class Qwen3Runner:
         # Run
         ireq = self.compiled.create_infer_request()
         outputs = ireq.infer({
-            "input_ids": input_ids,
+            "input_ids": input_ids_padded,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "beam_idx": beam_idx
@@ -74,9 +83,9 @@ class Qwen3Runner:
         logits = outputs["logits"]
         
         # Get next token
-        next_token = int(np.argmax(logits[0, SEQ_LEN-1, :]))
+        next_token = int(np.argmax(logits[0, seq_len-1, :]))
         
-        return f"[Generated: token={next_token}]"
+        return f"Generated token: {next_token}"
 
 
 def test():
@@ -87,7 +96,7 @@ def test():
     runner = Qwen3Runner()
     
     prompts = [
-        "What is AI?",
+        "What is artificial intelligence?",
     ]
     
     for p in prompts:
