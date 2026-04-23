@@ -492,7 +492,215 @@ FCP/
 
 ---
 
-## 15. Ссылки
+### 16.11 Adaptive Fusion Injector
+
+```python
+class AdaptiveFusionInjector:
+    def __init__(self, hidden_dim: int = 2048) -> None:
+        self.hidden_dim: int = hidden_dim
+        self.gate_proj: np.ndarray  # [2*hidden_dim, hidden_dim]
+        self.gate_bias: np.ndarray  # [hidden_dim]
+    
+    def inject(
+        self,
+        hidden_states: np.ndarray,
+        graph_vec: np.ndarray,
+        gate_weights: np.ndarray
+    ) -> np.ndarray:
+        """
+        Впрыснуть графовый контекст.
+        
+        Args:
+            hidden_states: [batch, seq_len, hidden_dim]
+            graph_vec: [hidden_dim]
+            gate_weights: [hidden_dim]
+        
+        Returns:
+            output: [batch, seq_len, hidden_dim]
+        """
+        pass
+    
+    def calibrate(
+        self,
+        samples: List[Tuple],
+        target_mean: float = 0.5
+    ) -> None:
+        """Калибровать gate bias."""
+        pass
+```
+
+### 16.12 Split Model Runner
+
+```python
+class SplitModelRunner:
+    def __init__(self, openvino_path: str) -> None:
+        self.openvino_path: str
+        self.kv_cache: dict = {}
+    
+    def load(self) -> None:
+        """Загрузить модель."""
+        pass
+    
+    def run_part1(self, prompt: str) -> np.ndarray:
+        """
+        Запустить первую часть (prefill).
+        
+        Args:
+            prompt: исходный промпт
+        
+        Returns:
+            hidden_states: [1, seq, hidden_dim]
+        """
+        pass
+    
+    def run_part2(
+        self,
+        hidden_states: np.ndarray,
+        kv_cache: dict = None,
+        max_tokens: int = 64
+    ) -> str:
+        """
+        Запустить вторую часть (decoding).
+        
+        Args:
+            hidden_states: [1, seq, hidden_dim]
+            kv_cache: предыдущий KV кэш
+            max_tokens: максимум токенов
+        
+        Returns:
+            generated text
+        """
+        pass
+    
+    def kv_cache_snapshot(self) -> dict:
+        """Сохранить KV кэш."""
+        pass
+    
+    def kv_cache_restore(self, snapshot: dict) -> None:
+        """Восстановить KV кэш."""
+        pass
+```
+
+### 16.13 Fractal Graph Encoder
+
+```python
+class FractalGraphEncoder:
+    def __init__(
+        self,
+        input_dim: int = 2560,
+        hidden_dim: int = 2048,
+        num_layers: int = 2
+    ) -> None:
+        self.input_dim: int = input_dim
+        self.hidden_dim: int = hidden_dim
+        self.num_layers: int = num_layers
+        self.proj: np.ndarray  # [input_dim, hidden_dim]
+        self.gate_proj: np.ndarray  # [2*hidden_dim, hidden_dim]
+    
+    def forward(
+        self,
+        node_embeddings: np.ndarray,
+        edge_index: np.ndarray,
+        mask: np.ndarray = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Энкодировать подграф.
+        
+        Args:
+            node_embeddings: [num_nodes, input_dim]
+            edge_index: [num_edges, 2]
+            mask: [num_nodes] или None
+        
+        Returns:
+            graph_vec: [hidden_dim]
+            gate_weights: [hidden_dim]
+        """
+        pass
+    
+    def distill_from_llm(
+        self,
+        llm_hidden: np.ndarray,
+        subgraph_data: np.ndarray
+    ) -> float:
+        """
+        MSE между graph_vec и LLM hidden states.
+        
+        Returns:
+            mse: float
+        """
+        pass
+```
+
+### 16.14 Graph Node Operations
+
+```python
+class SimpleGraph:
+    def __init__(self, db_path: str) -> None:
+        self._nodes: dict = {}
+    
+    def _load_nodes(self) -> None:
+        """Загрузить узлы из SQLite."""
+        pass
+    
+    def get_facts(self) -> list:
+        """Получить все факты."""
+        pass
+    
+    def get_dangling(self) -> list:
+        """Получить висячие узлы."""
+        pass
+    
+    def add_node(
+        self,
+        name: str,
+        type: str,
+        confidence: float
+    ) -> str:
+        """Добавить узел. Возвращает node_id."""
+        pass
+    
+    def add_edge(
+        self,
+        from_id: str,
+        to_id: str,
+        rel: str
+    ) -> None:
+        """Добавить ребро."""
+        pass
+    
+    def remove_node(self, node_id: str) -> None:
+        """Удалить узел."""
+        pass
+    
+    def apply_decay(self, factor: float) -> int:
+        """Применить распад. Возвращает количество."""
+        pass
+    
+    def search_keyword(
+        self,
+        keyword: str,
+        limit: int = 5
+    ) -> list:
+        """Поиск по ключевому слову."""
+        pass
+```
+
+### 16.15 TCM
+
+```python
+class SimpleTCM:
+    def __init__(self, max_history: int = 10) -> None:
+        self.max_history: int = max_history
+        self.history: list = []
+    
+    def add(self, role: str, content: str) -> None:
+        """Добавить в историю."""
+        pass
+```
+
+---
+
+## 17. Ссылки
 
 - **GitHub:** https://github.com/BlackCatSpb/fcp
 - **Модель:** Qwen3 4B Q4_K_M.gguf
@@ -500,7 +708,7 @@ FCP/
 
 ---
 
-## 16. Статус по SPEC
+## 18. Статус по SPEC
 
 | Компонент | Статус | Файл |
 |-----------|--------|------|
@@ -519,10 +727,13 @@ FCP/
 | ✅ LearningGraphManager | Реализован | v11 |
 | ✅ ShadowLoRA | Реализован | v10 |
 | ✅ UES | Реализован | v10 |
+| ✅ AdaptiveFusionInjector | Реализован | v10 |
+| ✅ SplitModelRunner | Реализован | v10 |
+| ✅ FractalGraphEncoder | Реализован | v10 |
 
 ---
 
-## 17. Следующие шаги
+## 19. Следующие шаги
 
 1. **Реальная GNN** — заменить упрощённую GNN на полную реализацию с HNSW
 2. **Обучить LoRA** — запустить co-training цикл
