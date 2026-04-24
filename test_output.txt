@@ -1,0 +1,18 @@
+============================================================
+Unified FCP Pipeline Test
+============================================================
+[1] Loading model...
+[2] Loading HNSW...
+No device provided, using cuda:0
+Loading SentenceTransformer model from sentence-transformers/all-MiniLM-L6-v2.
+SentenceTransformer загружен: sentence-transformers/all-MiniLM-L6-v2, dim=384
+HNSW-индекс инициализирован: dim=384, M=16
+Загружено 199 узлов
+HNSW-индекс построен: 199 узлов
+[3] Initializing TCM...
+[4] Ready! Layers: 36, Graph: 199 nodes
+
+
+============================================================
+Query 1/7 [simple]: Привет!
+============================================================
