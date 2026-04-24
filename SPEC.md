@@ -309,25 +309,57 @@ peft (для LoRA, опционально)
 ## 6. Приоритеты реализации
 
 ### Фаза 1: Базовая архитектура (MVP)
-- [ ] Input Layer + Output Layer
-- [ ] FractalGraphV2 из EVA-Ai
-- [ ] Basic Hybrid Layer (только transformer + graph retrieval)
-- [ ] Интеграция с OpenVINO Generator
-- [ ] Basic селективная активация
+- [X] Input Layer + Output Layer
+- [X] FractalGraphV2 из EVA-Ai
+- [X] Basic Hybrid Layer (только transformer + graph retrieval)
+- [X] Интеграция с OpenVINO Generator
+- [X] Basic селективная активация
 
 ### Фаза 2: Память
-- [ ] Temporal Context Memory
+- [X] Temporal Context Memory
 - [ ] Интеграция TCM --> Graph
 
 ### Фаза 3: КУРАЦИЯ
-- [ ] Concept Miner
-- [ ] Contradiction Miner
+- [X] Concept Miner (basic keyword)
+- [X] Intelligent Routing (domain-based)
 - [ ] Graph Curator
 
 ### Фаза 4: Продвинутые функции
-- [ ] LoRA адаптеры
-- [ ] Селективная активация (полная)
+- [X] LoRA structure ready
+- [X] Селективная активация (Early Exit)
 - [ ] UES базовая реализация
+
+---
+
+## NEW: FCP v15 Development Plan (from "Последовательные решения.txt")
+
+### Priority 1: Core Extensions
+- [ ] AdaLoRA Layer - адаптивный rank (4/8/16)
+- [ ] AdaptiveFusionInjector - graph vector injection
+
+### Priority 2: GNN Integration
+- [ ] FractalGraphEncoder (SAGEConv)
+- [ ] GNN → OpenVINO converter
+
+### Priority 3: LoRA Management
+- [ ] ShadowLoRA Manager
+- [ ] Adapter switching (r4/r8/r16)
+
+### Priority 4: Advanced Decoding
+- [ ] Speculative Decoding (draft model)
+- [ ] NNCF Quantization
+
+### Priority 5: Extended Memory
+- [ ] SemanticCacheEvictor
+- [ ] ScenarioTCM
+
+### Priority 6: Multi-Agent
+- [ ] ExpertSystem
+- [ ] ContradictionDetector
+- [ ] ToolOrchestrator
+
+### Priority 7: Final Integration
+- [ ] FCPPipelineV15
 
 ---
 
