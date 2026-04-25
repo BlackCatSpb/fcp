@@ -210,9 +210,14 @@ class FractalGraphEncoder(nn.Module):
         
         # Создаём edge_index (упрощённо - полный граф между найденными узлами)
         num_nodes = len(node_embs)
-        edge_index = np.array([
-            np.repeat(np.arange(num_nodes), np.roll(np.arange(num_nodes), 1)
-        ])
+        if num_nodes > 0:
+            # Create edges: each node connected to next
+            edge_index = np.array([
+                np.arange(num_nodes - 1),
+                np.arange(1, num_nodes)
+            ])
+        else:
+            edge_index = np.array([[], []])
         
         return {
             'x': node_embs,
@@ -263,7 +268,7 @@ class GraphEncoderRuntime:
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         
-        # Инициализируем веса (random для fallback)
+        # Initialize weights (numpy implementation)
         np.random.seed(42)
         self.W1 = np.random.randn(input_dim, hidden_dim).astype(np.float32) * 0.02
         self.W2 = np.random.randn(hidden_dim, output_dim).astype(np.float32) * 0.02
