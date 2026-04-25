@@ -53,43 +53,27 @@ FCP/FMF - полная когнитивная система, объединяю
 | Temporal Memory | ✅ | TCM 50 segments max |
 | HybridCache | ✅ | RAM + Disk, 50% hit rate |
 | Generation + Cache | ✅ | 39s → 0s on hit |
+| AdaLoRA | ✅ | adaptive rank (fcp_core/adaptive_lora.py) |
+| FractalGraphEncoder | ✅ | SAGEConv + HNSW (fcp_gnn/graph_encoder.py) |
+| Data Loaders | ✅ | ConceptNet, RuBQ, Saiga, NEREL (fcp_data/ru_data_loaders.py) |
+| GNN→OV Converter | ✅ | ONNX + OpenVINO (fcp_gnn/convert_gnn_to_ov.py) |
+| AdaptiveFusionInjector | ✅ | Graph vector injection (fcp_gnn/injector.py) |
+| ShadowLoRAManagerOV | ✅ | LoRA management (fcp_lora/shadow_lora_ov.py) |
+| LoRA Training | 🔄 | Colab (train_lora_v2.ipynb) |
 
 ## Upcoming Features (Plan)
 
-### Phase 1: GNN + LoRA (in Colab)
-- [ ] FractalGraphEncoder with SAGEConv
-- [ ] AdaLoRA with adaptive rank (4/8/16)
-- [ ] Co-training pipeline
-
-### Phase 2: OpenVINO Integration
-- [ ] GNN → ONNX → OpenVINO converter
-- [ ] AdaptiveFusionInjector
-- [ ] Graph vector injection
-
-### Phase 3: LoRA Management
-- [ ] ShadowLoRA Manager
-- [ ] Atomic adapter switching
-- [ ] Multiple adapters (r4/r8/r16)
-
-### Phase 4: Advanced Decoding
-- [ ] Speculative Decoding
-- [ ] Draft model integration
-- [ ] NNCF Quantization
-
-### Phase 5: Semantic Memory
+### Phase 2: Advanced Features
 - [ ] SemanticCacheEvictor
+- [ ] ClarificationGenerator  
 - [ ] ScenarioTCM (episodic memory)
-- [ ] ClarificationGenerator
+- [ ] ExpertSystem (multi-agent)
 
-### Phase 6: Multi-Agent
-- [ ] ExpertSystem
-- [ ] ContradictionDetector
-- [ ] Toolformer integration
-
-### Phase 7: Integration
-- [ ] FCPPipelineV15 (full pipeline)
-- [ ] AttributionReport
+### Phase 3: Integration
+- [ ] Toolformer
 - [ ] ThinkingController
+- [ ] AttributionReport
+- [ ] FCPPipelineV15 (full pipeline)
 
 ## Quick Start
 
