@@ -384,8 +384,8 @@ class MemBindBlock(torch.nn.Module):
         self.b_i = torch.nn.Parameter(torch.zeros(H, 1))
         self.W_decay = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
         self.b_decay = torch.nn.Parameter(torch.full((H, 1), 2.0))
-        self.W_read = torch.nn.Parameter(torch.zeros(H, self.r, cfg.D))
-        self.W_mem2v = torch.nn.Parameter(torch.zeros(cfg.D, bind_r))
+        self.W_read = torch.nn.Parameter(torch.randn(H, self.r, cfg.D) * 0.01)
+        self.W_mem2v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
 
     def forward(self, h: torch.Tensor, state: tuple | None = None) -> tuple:
         B, L, D = h.shape
