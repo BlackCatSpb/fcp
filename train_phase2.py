@@ -237,7 +237,7 @@ if ckpt_path:
 
 # ─── Analysis helper ─────────────────────────────────────────────────────
 @torch.no_grad()
-def generate_report(step, loss, ppl, model, loader, ckpt_path):
+def generate_report(step, loss, ppl, model, loader, ckpt_path, grad_norm=None):
     """Generate HTML report with model state analysis."""
     model.eval()
     # Collect stats from a small eval batch
@@ -246,14 +246,8 @@ def generate_report(step, loss, ppl, model, loader, ckpt_path):
     h, states = model.stack(h)
     logits = model.lm_head(h)
 
-    # Compute grad norms
-    total_grad = 0.0
-    n_grad = 0
-    for p in model.parameters():
-        if p.grad is not None:
-            total_grad += p.grad.norm().item() ** 2
-            n_grad += 1
-    grad_norm = math.sqrt(total_grad) if n_grad else 0.0
+    if grad_norm is None:
+        grad_norm = 0.0
 
     # Embedding stats
     embed_norm = model.embed.weight.norm().item()
@@ -352,6 +346,9 @@ try:
 
             if step % ACCUM_STEPS == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                # Capture grad norm BEFORE zero_grad
+                total_grad = sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None)
+                grad_norm = math.sqrt(total_grad)
                 lr = get_lr(step)
                 for g in optimizer.param_groups:
                     g['lr'] = lr
@@ -364,8 +361,8 @@ try:
                 ckpt_path = os.path.join(CKPT_DIR, f'phase2_step{step}.pt')
                 ppl_now = math.exp(epoch_loss / max(n_batches, 1))
                 save_checkpoint(ckpt_path, model, optimizer, None, step, epoch+1, best_ppl,
-                                {'train_loss': epoch_loss/max(n_batches,1), 'train_ppl': ppl_now})
-                generate_report(step, epoch_loss/max(n_batches,1), ppl_now, model, train_loader, ckpt_path)
+                                {'train_loss': epoch_loss/max(n_batches,1), 'train_ppl': ppl_now, 'grad_norm': grad_norm})
+                generate_report(step, epoch_loss/max(n_batches,1), ppl_now, model, train_loader, ckpt_path, grad_norm)
 
             if step % LOG_EVERY == 0:
                 ppl = math.exp(epoch_loss / max(n_batches, 1))
@@ -426,6 +423,8 @@ try:
 
 except KeyboardInterrupt:
     print(f'\n  [SIGINT] Saving checkpoint before exit...')
+    total_grad = sum(p.grad.norm().item() ** 2 for p in model.parameters() if p.grad is not None)
+    grad_norm = math.sqrt(total_grad)
     ckpt_path = os.path.join(CKPT_DIR, f'phase2_step{step}_interrupt.pt')
     ppl_now = math.exp(epoch_loss / max(n_batches, 1)) if n_batches > 0 else float('inf')
     save_checkpoint(ckpt_path, model, optimizer, None, step, epoch+1, best_ppl,
