@@ -10,7 +10,8 @@ python train_phase2.py ^
     --n_layers 24 --bottleneck 896 ^
     --seq_len 128 --batch_size 2 --accum_steps 16 ^
     --train_chunks 20000 --log_every 100 ^
-    --lr 1e-3 --epochs 5 --log_every 100
+    --lr 1e-3 --epochs 5 ^
+    --ckpt_every 1000
 if %ERRORLEVEL% NEQ 0 (
     echo.
     echo Training failed with error code %ERRORLEVEL%
