@@ -357,14 +357,14 @@ for epoch in range(start_epoch, EPOCHS):
             optimizer.step()
             optimizer.zero_grad()
 
-            # Step-based checkpoint
-            ckpt_every = args.ckpt_every
-            if ckpt_every > 0 and step % ckpt_every == 0:
-                ckpt_path = os.path.join(CKPT_DIR, f'phase2_step{step}.pt')
-                ppl_now = math.exp(epoch_loss / max(n_batches, 1))
-                save_checkpoint(ckpt_path, model, optimizer, None, step, epoch+1, best_ppl,
-                                {'train_loss': epoch_loss/max(n_batches,1), 'train_ppl': ppl_now})
-                generate_report(step, epoch_loss/max(n_batches,1), ppl_now, model, train_loader, ckpt_path)
+        # Step-based checkpoint (outside ACCUM_STEPS guard — triggers on exact step)
+        ckpt_every = args.ckpt_every
+        if ckpt_every > 0 and step % ckpt_every == 0:
+            ckpt_path = os.path.join(CKPT_DIR, f'phase2_step{step}.pt')
+            ppl_now = math.exp(epoch_loss / max(n_batches, 1))
+            save_checkpoint(ckpt_path, model, optimizer, None, step, epoch+1, best_ppl,
+                            {'train_loss': epoch_loss/max(n_batches,1), 'train_ppl': ppl_now})
+            generate_report(step, epoch_loss/max(n_batches,1), ppl_now, model, train_loader, ckpt_path)
 
         if step % LOG_EVERY == 0:
             ppl = math.exp(epoch_loss / max(n_batches, 1))
