@@ -323,33 +323,62 @@ tr:hover {{ background: #f0f0f0; }}
 print(f'\nTraining: {n_train//BATCH_SIZE} steps/epoch, {EPOCHS} epochs')
 print(f'  total_steps={total_steps}, warmup_steps={warmup_steps}')
 
-for epoch in range(start_epoch, EPOCHS):
-    model.train()
-    epoch_loss = 0.0
-    n_batches = 0
-    optimizer.zero_grad()
+try:
+    for epoch in range(start_epoch, EPOCHS):
+        model.train()
+        epoch_loss = 0.0
+        n_batches = 0
+        optimizer.zero_grad()
 
-    for bx, by in train_loader:
-        logits = model(bx)
+        for bx, by in train_loader:
+            logits = model(bx)
 
-        if torch.isnan(logits).any():
-            print(f'  [NAN] logits at step {step}, skipping')
-            continue
+            if torch.isnan(logits).any():
+                print(f'  [NAN] logits at step {step}, skipping')
+                continue
 
-        loss = F.cross_entropy(logits.reshape(-1, VOCAB), by.reshape(-1))
+            loss = F.cross_entropy(logits.reshape(-1, VOCAB), by.reshape(-1))
 
-        if torch.isnan(loss):
-            print(f'  [NAN] loss at step {step}, skipping')
-            continue
+            if torch.isnan(loss):
+                print(f'  [NAN] loss at step {step}, skipping')
+                continue
 
-        loss = loss / ACCUM_STEPS
-        loss.backward()
+            loss = loss / ACCUM_STEPS
+            loss.backward()
 
-        epoch_loss += loss.item() * ACCUM_STEPS
-        n_batches += 1
-        step += 1
+            epoch_loss += loss.item() * ACCUM_STEPS
+            n_batches += 1
+            step += 1
 
-        if step % ACCUM_STEPS == 0:
+            if step % ACCUM_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                lr = get_lr(step)
+                for g in optimizer.param_groups:
+                    g['lr'] = lr
+                optimizer.step()
+                optimizer.zero_grad()
+
+            # Step-based checkpoint (outside ACCUM_STEPS guard — triggers on exact step)
+            ckpt_every = args.ckpt_every
+            if ckpt_every > 0 and step % ckpt_every == 0:
+                ckpt_path = os.path.join(CKPT_DIR, f'phase2_step{step}.pt')
+                ppl_now = math.exp(epoch_loss / max(n_batches, 1))
+                save_checkpoint(ckpt_path, model, optimizer, None, step, epoch+1, best_ppl,
+                                {'train_loss': epoch_loss/max(n_batches,1), 'train_ppl': ppl_now})
+                generate_report(step, epoch_loss/max(n_batches,1), ppl_now, model, train_loader, ckpt_path)
+
+            if step % LOG_EVERY == 0:
+                ppl = math.exp(epoch_loss / max(n_batches, 1))
+                lr_now = optimizer.param_groups[0]['lr']
+                v_info = ''
+                if ARCH == 'ld' and hasattr(model.stack, 'cfg') and model.stack.cfg.learnable_V:
+                    norms = [l.V_cay_A.norm().item() + l.V_cay_B.norm().item()
+                             for l in model.stack.layers if hasattr(l, 'V_cay_A') and l.V_cay_A is not None]
+                    v_info = f' |A+B|~[{", ".join(f"{n:.2f}" for n in norms)}]'
+                print(f'  Step {step:5d} | loss={epoch_loss/max(n_batches,1):.4f} | ppl={ppl:.1f} | lr={lr_now:.2e}{v_info}')
+
+        # Flush accumulated gradients at epoch end
+        if step % ACCUM_STEPS != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             lr = get_lr(step)
             for g in optimizer.param_groups:
@@ -357,71 +386,53 @@ for epoch in range(start_epoch, EPOCHS):
             optimizer.step()
             optimizer.zero_grad()
 
-        # Step-based checkpoint (outside ACCUM_STEPS guard — triggers on exact step)
-        ckpt_every = args.ckpt_every
-        if ckpt_every > 0 and step % ckpt_every == 0:
-            ckpt_path = os.path.join(CKPT_DIR, f'phase2_step{step}.pt')
-            ppl_now = math.exp(epoch_loss / max(n_batches, 1))
-            save_checkpoint(ckpt_path, model, optimizer, None, step, epoch+1, best_ppl,
-                            {'train_loss': epoch_loss/max(n_batches,1), 'train_ppl': ppl_now})
-            generate_report(step, epoch_loss/max(n_batches,1), ppl_now, model, train_loader, ckpt_path)
+        if n_batches > 0:
+            train_ppl = math.exp(epoch_loss / n_batches)
+        else:
+            train_ppl = float('inf')
+            print(f'  [WARN] No valid batches in epoch {epoch+1}')
 
-        if step % LOG_EVERY == 0:
-            ppl = math.exp(epoch_loss / max(n_batches, 1))
-            lr_now = optimizer.param_groups[0]['lr']
-            v_info = ''
-            if ARCH == 'ld' and hasattr(model.stack, 'cfg') and model.stack.cfg.learnable_V:
-                norms = [l.V_cay_A.norm().item() + l.V_cay_B.norm().item()
-                         for l in model.stack.layers if hasattr(l, 'V_cay_A') and l.V_cay_A is not None]
-                v_info = f' |A+B|~[{", ".join(f"{n:.2f}" for n in norms)}]'
-            print(f'  Step {step:5d} | loss={epoch_loss/max(n_batches,1):.4f} | ppl={ppl:.1f} | lr={lr_now:.2e}{v_info}')
+        model.eval()
+        eval_loss = 0.0
+        all_gate_info = []
+        with torch.no_grad():
+            for bx, by in eval_loader:
+                if ARCH == 'ld':
+                    logits, gates = model(bx, return_gates=True)
+                    H = -(gates * (gates + 1e-10).log()).sum(dim=-1).mean(dim=(1, 2))
+                    all_gate_info.append(H)
+                else:
+                    logits = model(bx)
+                loss = F.cross_entropy(logits.reshape(-1, VOCAB), by.reshape(-1))
+                eval_loss += loss.item()
+        eval_ppl = math.exp(eval_loss / len(eval_loader))
 
-    # Flush accumulated gradients at epoch end
-    if step % ACCUM_STEPS != 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        lr = get_lr(step)
-        for g in optimizer.param_groups:
-            g['lr'] = lr
-        optimizer.step()
-        optimizer.zero_grad()
+        if ARCH == 'ld' and all_gate_info:
+            avg_entropy = torch.stack(all_gate_info).mean(dim=0).cpu().tolist()
+            max_entropy = math.log(N_MODES)
+            print(f'  Gate entropy per layer: {[f"{e:.3f}" for e in avg_entropy]}')
+            print(f'  Max possible H={max_entropy:.3f}, mean H={sum(avg_entropy)/len(avg_entropy):.3f}')
 
-    if n_batches > 0:
-        train_ppl = math.exp(epoch_loss / n_batches)
-    else:
-        train_ppl = float('inf')
-        print(f'  [WARN] No valid batches in epoch {epoch+1}')
-
-    model.eval()
-    eval_loss = 0.0
-    all_gate_info = []
-    with torch.no_grad():
-        for bx, by in eval_loader:
-            if ARCH == 'ld':
-                logits, gates = model(bx, return_gates=True)
-                H = -(gates * (gates + 1e-10).log()).sum(dim=-1).mean(dim=(1, 2))
-                all_gate_info.append(H)
-            else:
-                logits = model(bx)
-            loss = F.cross_entropy(logits.reshape(-1, VOCAB), by.reshape(-1))
-            eval_loss += loss.item()
-    eval_ppl = math.exp(eval_loss / len(eval_loader))
-
-    if ARCH == 'ld' and all_gate_info:
-        avg_entropy = torch.stack(all_gate_info).mean(dim=0).cpu().tolist()
-        max_entropy = math.log(N_MODES)
-        print(f'  Gate entropy per layer: {[f"{e:.3f}" for e in avg_entropy]}')
-        print(f'  Max possible H={max_entropy:.3f}, mean H={sum(avg_entropy)/len(avg_entropy):.3f}')
-
-    print(f'>> Epoch {epoch+1}: train_ppl={train_ppl:.1f}, eval_ppl={eval_ppl:.1f}')
-    is_best = eval_ppl < best_ppl
-    if is_best:
-        best_ppl = eval_ppl
-        save_checkpoint(os.path.join(CKPT_DIR, 'phase2_best.pt'),
+        print(f'>> Epoch {epoch+1}: train_ppl={train_ppl:.1f}, eval_ppl={eval_ppl:.1f}')
+        is_best = eval_ppl < best_ppl
+        if is_best:
+            best_ppl = eval_ppl
+            save_checkpoint(os.path.join(CKPT_DIR, 'phase2_best.pt'),
+                            model, optimizer, None, step, epoch+1, best_ppl,
+                            {'train_ppl': train_ppl, 'eval_ppl': eval_ppl})
+        save_checkpoint(os.path.join(CKPT_DIR, f'phase2_epoch{epoch+1}.pt'),
                         model, optimizer, None, step, epoch+1, best_ppl,
-                        {'train_ppl': train_ppl, 'eval_ppl': eval_ppl})
-    save_checkpoint(os.path.join(CKPT_DIR, f'phase2_epoch{epoch+1}.pt'),
-                    model, optimizer, None, step, epoch+1, best_ppl,
-                    {'train_ppl': train_ppl, 'eval_ppl': eval_ppl, 'is_best': is_best})
+                        {'train_ppl': train_ppl, 'eval_ppl': eval_ppl, 'is_best': is_best})
+
+except KeyboardInterrupt:
+    print(f'\n  [SIGINT] Saving checkpoint before exit...')
+    ckpt_path = os.path.join(CKPT_DIR, f'phase2_step{step}_interrupt.pt')
+    ppl_now = math.exp(epoch_loss / max(n_batches, 1)) if n_batches > 0 else float('inf')
+    save_checkpoint(ckpt_path, model, optimizer, None, step, epoch+1, best_ppl,
+                    {'train_loss': epoch_loss/max(n_batches,1) if n_batches else 0,
+                     'train_ppl': ppl_now, 'interrupted': True})
+    print(f'  Interrupted at step {step}. Run again to resume.')
+    sys.exit(0)
 
 print(f'\nTime: {time.perf_counter()-t_start:.0f}s')
 print(f'Best eval PPL: {best_ppl:.1f}')

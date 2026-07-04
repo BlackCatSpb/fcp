@@ -374,7 +374,7 @@ class MemBindBlock(torch.nn.Module):
         # Bind adaptation (FCF-inspired u*v interaction, no gates)
         self.W_u = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
         self.W_v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
-        self.W_out = torch.nn.Parameter(torch.zeros(bind_r, cfg.D))
+        self.W_out = torch.nn.Parameter(torch.randn(bind_r, cfg.D) * 0.01)
 
         # Multi-head covariance memory
         H = self.H
