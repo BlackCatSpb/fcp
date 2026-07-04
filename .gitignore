@@ -1,0 +1,33 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*.pyo
+*$py.class
+
+# Env
+.env
+.venv
+venv/
+
+# Data files (too large for git)
+*.npy
+*.npz
+*.pth
+*.pt
+checkpoints/
+
+# Logs
+*.log
+*.err
+*.txt
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

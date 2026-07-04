@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cogniflex"
+version = "0.1.0"
+description = "CogniFlex AI toolkit"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["eva*"]
+
+[project.scripts]
+eva = "eva.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+norecursedirs = ["scripts", "tools"]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+log_cli_date_format = "%H:%M:%S"
+log_file = "pytest.log"
+log_file_level = "INFO"
+filterwarnings = [
+    "ignore:Importing 'parser\\.split_arg_string' is deprecated:DeprecationWarning"
+]
