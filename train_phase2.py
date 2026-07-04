@@ -37,11 +37,19 @@ parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--warmup_frac', type=float, default=0.05)
 parser.add_argument('--grad_clip', type=float, default=1.0)
 parser.add_argument('--log_every', type=int, default=100)
+parser.add_argument('--spectrum', default='fib_seq',
+                    help='Spectrum type: fib_root, fib_seq, fib_ratio, linear, hybrid')
+parser.add_argument('--spec_lo', type=float, default=0.8,
+                    help='Lower bound for spectrum range')
+parser.add_argument('--spec_hi', type=float, default=1.8,
+                    help='Upper bound for spectrum range')
+parser.add_argument('--n_modes', type=int, default=8,
+                    help='Number of spectral modes / frequencies (K)')
 args = parser.parse_args()
 
 D = 896
 VOCAB = 50000
-N_MODES = 4
+N_MODES = args.n_modes
 N_LAYERS = args.n_layers
 BATCH_SIZE = args.batch_size
 ACCUM_STEPS = args.accum_steps
@@ -103,6 +111,9 @@ cfg.arch = ARCH
 cfg.cov_heads = 4
 cfg.cov_r = 16
 cfg.bind_r = 16
+cfg.spectrum_type = args.spectrum
+cfg.spec_lo = args.spec_lo
+cfg.spec_hi = args.spec_hi
 
 # ─── Model ───────────────────────────────────────────────────────────────
 class Phase2Model(nn.Module):
@@ -130,6 +141,11 @@ model = Phase2Model(cfg, arch=ARCH).to(DEVICE)
 n_all = sum(p.numel() for p in model.parameters())
 n_t = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f'Model: {n_all/1e6:.1f}M params ({n_t/1e6:.1f}M trainable, arch={ARCH})')
+if ARCH == 'membind':
+    sample_λ = model.stack.layers[0].lambda_k
+    sample_bs = model.stack.layers[0].block_sizes
+    print(f'  Spectrum: {args.spectrum}  K={N_MODES}  λ∈[{float(sample_λ.min()):.4f},{float(sample_λ.max()):.4f}]')
+    print(f'  Blocks: {sample_bs}')
 
 # ─── Checkpoint helpers ──────────────────────────────────────────────────
 def save_checkpoint(path, model, optimizer, scheduler, step, epoch, best_ppl, stats):
@@ -143,6 +159,7 @@ def save_checkpoint(path, model, optimizer, scheduler, step, epoch, best_ppl, st
             'N_LAYERS': N_LAYERS, 'BATCH_SIZE': BATCH_SIZE,
             'ACCUM_STEPS': ACCUM_STEPS, 'SEQ_LEN': SEQ_LEN, 'LR': LR,
             'EPOCHS': EPOCHS, 'ARCH': ARCH, 'BOTTLENECK': BOTTLENECK,
+            'SPECTRUM': args.spectrum, 'SPEC_LO': args.spec_lo, 'SPEC_HI': args.spec_hi,
         }
     }
     if scheduler is not None:

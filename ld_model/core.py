@@ -30,6 +30,10 @@ class LDConfig:
     cov_heads: int = 4     # multi-head covariance heads (MemBind)
     cov_r: int = 16        # covariance rank per head (MemBind)
     bind_r: int = 16       # bind projection rank (MemBind)
+    # Spectrum options
+    spectrum_type: str = 'fib_root'  # 'fib_root', 'fib_seq', 'fib_ratio', 'linear', 'hybrid'
+    spec_lo: float = 0.8   # lower bound for λ range
+    spec_hi: float = 1.8   # upper bound for λ range
 
 
 # ─── Fibonacci roots ────────────────────────────────────────────────────
@@ -49,6 +53,68 @@ def fibonacci_roots(max_k: int = 7) -> torch.Tensor:
 
 
 # ─── Orthogonal V ───────────────────────────────────────────────────────
+
+def fibonacci_sequence(n: int) -> list:
+    """First n Fibonacci numbers: F_1=1, F_2=1, ..."""
+    seq = [1, 1]
+    for _ in range(2, n):
+        seq.append(seq[-1] + seq[-2])
+    return seq[:n]
+
+def compute_spectrum(cfg: LDConfig) -> tuple:
+    """Return (lambda_k_tensor, block_sizes_list) based on cfg.spectrum_type."""
+    K = cfg.n_modes
+    D = cfg.D
+    lo, hi = cfg.spec_lo, cfg.spec_hi
+
+    if cfg.spectrum_type == 'fib_root':
+        lambda_roots = fibonacci_roots(K + 1)
+        block_sizes = [D // K] * K
+        return lambda_roots, block_sizes
+
+    elif cfg.spectrum_type == 'fib_seq':
+        fibs = fibonacci_sequence(K + 2)[1:-1]  # F_2..F_{K+1}
+        lambdas = torch.tensor(fibs, dtype=torch.float32)
+        if len(fibs) == 1:
+            lambdas = torch.tensor([(lo + hi) / 2])
+        else:
+            mn, mx = min(fibs), max(fibs)
+            lambdas = lo + (lambdas - mn) / (mx - mn) * (hi - lo) * 0.9999
+        total_fib = sum(fibs)
+        block_sizes = [max(1, round(f * D / total_fib)) for f in fibs]
+        diff = D - sum(block_sizes)
+        block_sizes[-1] += diff
+        return lambdas, block_sizes
+
+    elif cfg.spectrum_type == 'fib_ratio':
+        fibs = fibonacci_sequence(K + 3)
+        ratios = [fibs[i+1] / fibs[i] for i in range(1, K + 1)]
+        lambdas = torch.tensor(sorted(ratios), dtype=torch.float32)
+        mn, mx = min(ratios), max(ratios)
+        lambdas = lo + (lambdas - mn) / (mx - mn) * (hi - lo) * 0.9999 if mx != mn else torch.full_like(lambdas, (lo + hi) / 2)
+        block_sizes = [D // K] * K
+        return lambdas, block_sizes
+
+    elif cfg.spectrum_type == 'linear':
+        lambdas = torch.linspace(lo, hi * 0.9999, K)
+        block_sizes = [D // K] * K
+        return lambdas, block_sizes
+
+    elif cfg.spectrum_type == 'hybrid':
+        # fib_ratio + linear averaged
+        fibs = fibonacci_sequence(K + 3)
+        ratios = sorted([fibs[i+1] / fibs[i] for i in range(1, K + 1)])
+        lambdas_r = torch.tensor(ratios, dtype=torch.float32)
+        mn_r, mx_r = min(ratios), max(ratios)
+        lambdas_r = lo + (lambdas_r - mn_r) / (mx_r - mn_r) * (hi - lo) * 0.9999 if mx_r != mn_r else torch.full_like(lambdas_r, (lo + hi) / 2)
+        lambdas_l = torch.linspace(lo, hi * 0.9999, K)
+        lambdas = (lambdas_r + lambdas_l) / 2
+        block_sizes = [D // K] * K
+        return lambdas, block_sizes
+
+    else:
+        raise ValueError(f"Unknown spectrum_type={cfg.spectrum_type}")
+
 
 def random_orthogonal(D: int, n_reflections: int | None = None) -> torch.Tensor:
     if n_reflections is None:
@@ -275,11 +341,13 @@ class MemBindBlock(torch.nn.Module):
     5. Spectral: Δ = V·diag(λ)·V^T·h_adapt
     6. h_out = h + Δ
     """
-    def __init__(self, cfg: LDConfig, layer_idx: int, lambda_roots: torch.Tensor):
+    def __init__(self, cfg: LDConfig, layer_idx: int, lambda_roots: torch.Tensor,
+                 block_sizes: list | None = None):
         super().__init__()
         self.D = cfg.D
         self.K = cfg.n_modes
         self.block_size = cfg.D // cfg.n_modes
+        self.block_sizes = block_sizes if block_sizes else [self.block_size] * self.K
         self.H = cfg.cov_heads
         self.r = cfg.cov_r
         bind_r = cfg.bind_r
@@ -291,6 +359,7 @@ class MemBindBlock(torch.nn.Module):
         self.register_buffer('V', V_init)
         self.register_buffer('V_T', V_init.T.contiguous())
         self.register_buffer('lambda_k', lambda_roots)
+        self.register_buffer('block_sizes_t', torch.tensor(self.block_sizes, dtype=torch.long))
 
         # Bind adaptation (FCF-inspired u*v interaction, no gates)
         self.W_u = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
@@ -343,8 +412,12 @@ class MemBindBlock(torch.nn.Module):
         h_adapt = h_norm + (u * v_enh) @ self.W_out
 
         h_proj = h_adapt @ self.V_T
-        h_proj_r = h_proj.view(B, L, self.K, self.block_size)
-        h_scaled = (h_proj_r * self.lambda_k.view(1, 1, self.K, 1)).reshape(B, L, self.D)
+        if all(s == self.block_size for s in self.block_sizes):
+            h_proj_r = h_proj.view(B, L, self.K, self.block_size)
+            h_scaled = (h_proj_r * self.lambda_k.view(1, 1, self.K, 1)).reshape(B, L, self.D)
+        else:
+            h_blocks = list(torch.split(h_proj, self.block_sizes, dim=-1))
+            h_scaled = torch.cat([b * lam for b, lam in zip(h_blocks, self.lambda_k)], dim=-1)
         delta_spec = h_scaled @ self.V
 
         return h + delta_spec, None
@@ -358,9 +431,9 @@ class MemBindStack(torch.nn.Module):
         self.cfg = cfg
         self.D = cfg.D
         self.n_layers = cfg.n_layers
-        lambda_roots = fibonacci_roots(cfg.n_modes + 1)
+        lambda_k, block_sizes = compute_spectrum(cfg)
         self.layers = torch.nn.ModuleList([
-            MemBindBlock(cfg, i, lambda_roots) for i in range(cfg.n_layers)
+            MemBindBlock(cfg, i, lambda_k, block_sizes) for i in range(cfg.n_layers)
         ])
         self.mlps = torch.nn.ModuleList([
             BottleneckMLP(cfg.D, cfg.bottleneck) for _ in range(cfg.n_layers)
