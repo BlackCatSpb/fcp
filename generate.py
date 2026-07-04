@@ -8,19 +8,23 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 D, VOCAB, N_MODES, N_LAYERS = 896, 50000, 4, 12
 
 class Phase2Model(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, recurrent=False):
         super().__init__()
         self.embed = torch.nn.Embedding(VOCAB, D)
         cfg = LDConfig()
         cfg.D = D; cfg.n_layers = N_LAYERS; cfg.n_modes = N_MODES
-        cfg.vocab = VOCAB; cfg.bottleneck = 256
+        cfg.vocab = VOCAB; cfg.bottleneck = 512; cfg.kernel_size = 48
+        cfg.recurrent_scan = recurrent
+        cfg.weight_tying = True; cfg.lm_head_bias = True
         self.stack = LDStack(cfg)
-        self.lm_head = torch.nn.Linear(D, VOCAB, bias=False)
+        self.lm_head = torch.nn.Linear(D, VOCAB, bias=cfg.lm_head_bias)
+        if cfg.weight_tying:
+            self.lm_head.weight = self.embed.weight
     def forward(self, x):
         return self.lm_head(self.stack(self.embed(x)))
 
-def load_model(path):
-    model = Phase2Model().to(DEVICE)
+def load_model(path, recurrent=False):
+    model = Phase2Model(recurrent=recurrent).to(DEVICE)
     ckpt = torch.load(path, map_location=DEVICE, weights_only=True)
     sd = ckpt.get('model_state_dict') or ckpt.get('model') or ckpt.get('model_fp16', ckpt)
     if sd is ckpt.get('model_fp16', None):
@@ -32,8 +36,18 @@ def load_model(path):
 @torch.no_grad()
 def generate(model, ids, n_tokens=200, temp=0.8, top_k=40):
     ids = ids.to(DEVICE)
+    # Receptive field for sliding window (parallel mode)
+    k = model.stack.cfg.kernel_size
+    l = model.stack.n_layers
+    rf = 1 + (k - 1) * l  # causal conv receptive field
     for _ in range(n_tokens):
-        logits = model(ids)[:, -1, :]
+        if model.stack.cfg.recurrent_scan:
+            # Stateful — only need last token
+            logits = model(ids[:, -1:])[:, -1, :]
+        else:
+            # Sliding window for efficiency
+            ctx = ids[:, -rf:] if ids.shape[1] > rf else ids
+            logits = model(ctx)[:, -1, :]
         if top_k > 0:
             vals, _ = torch.topk(logits, top_k)
             logits[logits < vals[:, -1:]] = -float('Inf')
@@ -50,10 +64,11 @@ if __name__ == '__main__':
     parser.add_argument('--temp', type=float, default=0.8)
     parser.add_argument('--top_k', type=int, default=40)
     parser.add_argument('--prompt', type=str, default='Привет, как дела?')
+    parser.add_argument('--recurrent', action='store_true', help='use λ_d token recurrence (infinite context)')
     args = parser.parse_args()
 
     tok = HFTokenizer.from_file('russian_tokenizer/tokenizer.json')
-    model = load_model(args.ckpt)
+    model = load_model(args.ckpt, recurrent=args.recurrent)
     n = sum(p.numel() for p in model.parameters())
     print(f'Model: {n/1e6:.1f}M params | {args.ckpt}', flush=True)
 
