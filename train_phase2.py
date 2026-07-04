@@ -1,6 +1,7 @@
 """
-Phase 2: 12-layer LDStack at D=896 with causal conv + dense bottleneck MLP.
-Training: gradient accumulation (eff batch=32) + linear warmup (5%).
+Phase 2: MemBind training with gradient accumulation + warmup.
+--arch ld for legacy sigmoid architecture.
+Full architecture description: LAMBDA_ARCHITECTURE.md
 """
 
 import os, sys, math, time, glob
@@ -11,39 +12,58 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ld_model.core import LDConfig, LDStack
+from ld_model.core import LDConfig, LDStack, MemBindStack
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {DEVICE}')
 
-# ─── Config ──────────────────────────────────────────────────────────────
-D = 896
-VOCAB = 50000
-N_MODES = 4
-N_LAYERS = 12
-BATCH_SIZE = 4
-ACCUM_STEPS = 8          # effective batch = 32
-SEQ_LEN = 128
-LR = 1e-3
-WARMUP_FRAC = 0.05
-EPOCHS = 3
-GRAD_CLIP = 1.0
-LOG_EVERY = 100
-CKPT_DIR = 'checkpoints'
-
 # ─── Argparse ────────────────────────────────────────────────────────────
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument('--data', default='wikitext',
+parser.add_argument('--arch', default='membind', choices=['ld', 'membind'],
+                    help='Architecture: ld (sigmoid-gated) or membind (next-gen, no sigmoid)')
+parser.add_argument('--data', default='russian',
                     choices=['wikitext', 'russian', 'auto'],
-                    help='Dataset to use (wikitext, russian, or auto-detect)')
-parser.add_argument('--train_chunks', type=int, default=None,
-                    help='Number of training chunks (default: all available)')
+                    help='Dataset to use')
+parser.add_argument('--train_chunks', type=int, default=None)
 parser.add_argument('--eval_chunks', type=int, default=500)
-parser.add_argument('--epochs', type=int, default=EPOCHS)
+parser.add_argument('--epochs', type=int, default=3)
+parser.add_argument('--n_layers', type=int, default=24,
+                    help='Number of layers (default 24 for scaling)')
+parser.add_argument('--bottleneck', type=int, default=896,
+                    help='MLP bottleneck dim (default = D for dense expansion)')
+parser.add_argument('--seq_len', type=int, default=128)
+parser.add_argument('--batch_size', type=int, default=4)
+parser.add_argument('--accum_steps', type=int, default=8)
+parser.add_argument('--lr', type=float, default=1e-3)
+parser.add_argument('--warmup_frac', type=float, default=0.05)
+parser.add_argument('--grad_clip', type=float, default=1.0)
+parser.add_argument('--log_every', type=int, default=100)
+parser.add_argument('--spectrum', default='fib_seq',
+                    help='Spectrum type: fib_root, fib_seq, fib_ratio, linear, hybrid')
+parser.add_argument('--spec_lo', type=float, default=0.8,
+                    help='Lower bound for spectrum range')
+parser.add_argument('--spec_hi', type=float, default=1.8,
+                    help='Upper bound for spectrum range')
+parser.add_argument('--n_modes', type=int, default=8,
+                    help='Number of spectral modes / frequencies (K)')
 args = parser.parse_args()
-if args.epochs != EPOCHS:
-    EPOCHS = args.epochs
+
+D = 896
+VOCAB = 50000
+N_MODES = args.n_modes
+N_LAYERS = args.n_layers
+BATCH_SIZE = args.batch_size
+ACCUM_STEPS = args.accum_steps
+SEQ_LEN = args.seq_len
+LR = args.lr
+WARMUP_FRAC = args.warmup_frac
+EPOCHS = args.epochs
+GRAD_CLIP = args.grad_clip
+LOG_EVERY = args.log_every
+BOTTLENECK = args.bottleneck
+ARCH = args.arch
+CKPT_DIR = 'checkpoints'
 
 # ─── Load data ───────────────────────────────────────────────────────────
 def choose_data(data_choice):
@@ -71,41 +91,75 @@ eval_ids = torch.tensor(arr[n_train:n_train + n_eval], dtype=torch.long)
 print(f'Train: {n_train} chunks ({n_train * SEQ_LEN / 1e6:.1f}M tok), '
       f'Eval: {n_eval} chunks ({n_eval * SEQ_LEN / 1e6:.1f}M tok)')
 
-train_x = train_ids[:, :-1].to(DEVICE)
-train_y = train_ids[:, 1:].to(DEVICE)
-eval_x = eval_ids[:, :-1].to(DEVICE)
-eval_y = eval_ids[:, 1:].to(DEVICE)
+class ChunkDataset(torch.utils.data.Dataset):
+    """Держит данные на CPU, отдаёт батчи на GPU по запросу."""
+    def __init__(self, ids, seq_len):
+        self.ids = ids  # (N, seq_len) на CPU
+    def __len__(self):
+        return len(self.ids)
+    def __getitem__(self, idx):
+        return self.ids[idx]
 
-train_loader = DataLoader(TensorDataset(train_x, train_y), batch_size=BATCH_SIZE, shuffle=True)
-eval_loader = DataLoader(TensorDataset(eval_x, eval_y), batch_size=BATCH_SIZE)
+def collate_chunk(batch):
+    ids = torch.stack(batch).to(DEVICE)  # (B, seq_len) single GPU alloc
+    return ids[:, :-1], ids[:, 1:]
+
+train_loader = DataLoader(ChunkDataset(train_ids, SEQ_LEN), batch_size=BATCH_SIZE, shuffle=True,
+                          collate_fn=collate_chunk)
+eval_loader = DataLoader(ChunkDataset(eval_ids, SEQ_LEN), batch_size=BATCH_SIZE,
+                         collate_fn=collate_chunk)
+
+# ─── Build config ─────────────────────────────────────────────────────────
+cfg = LDConfig()
+cfg.D = D
+cfg.n_layers = N_LAYERS
+cfg.n_modes = N_MODES
+cfg.vocab = VOCAB
+cfg.bottleneck = BOTTLENECK
+cfg.kernel_size = 48
+cfg.weight_tying = True
+cfg.lm_head_bias = True
+cfg.arch = ARCH
+cfg.cov_heads = 4
+cfg.cov_r = 16
+cfg.bind_r = 16
+cfg.spectrum_type = args.spectrum
+cfg.spec_lo = args.spec_lo
+cfg.spec_hi = args.spec_hi
 
 # ─── Model ───────────────────────────────────────────────────────────────
 class Phase2Model(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg, arch='membind'):
         super().__init__()
+        self.arch = arch
         self.embed = nn.Embedding(VOCAB, D)
-        cfg = LDConfig()
-        cfg.D = D
-        cfg.n_layers = N_LAYERS
-        cfg.n_modes = N_MODES
-        cfg.vocab = VOCAB
-        cfg.bottleneck = 256
-        self.stack = LDStack(cfg)
-        self.lm_head = nn.Linear(D, VOCAB, bias=False)
+        nn.init.uniform_(self.embed.weight, -1.0 / math.sqrt(D), 1.0 / math.sqrt(D))
+        if arch == 'ld':
+            self.stack = LDStack(cfg)
+        else:
+            self.stack = MemBindStack(cfg)
+        self.lm_head = nn.Linear(D, VOCAB, bias=True)
+        self.lm_head.weight = self.embed.weight
 
     def forward(self, input_ids, return_gates=False):
         h = self.embed(input_ids)
-        if return_gates:
+        if self.arch == 'ld' and return_gates:
             h, gates = self.stack(h, return_gates=True)
             return self.lm_head(h), gates
         h = self.stack(h)
+        if self.arch == 'membind':
+            h = h[0]  # MemBindStack returns (h, states)
         return self.lm_head(h)
 
-model = Phase2Model().to(DEVICE)
+model = Phase2Model(cfg, arch=ARCH).to(DEVICE)
 n_all = sum(p.numel() for p in model.parameters())
 n_t = sum(p.numel() for p in model.parameters() if p.requires_grad)
-n_v = sum(p.numel() for n, p in model.named_parameters() if 'V_cay' in n)
-print(f'Model: {n_all/1e6:.1f}M params ({n_t/1e6:.1f}M trainable, {n_v:,} Cayley)')
+print(f'Model: {n_all/1e6:.1f}M params ({n_t/1e6:.1f}M trainable, arch={ARCH})')
+if ARCH == 'membind':
+    sample_l = model.stack.layers[0].lambda_k
+    sample_bs = model.stack.layers[0].block_sizes
+    print(f'  Spectrum: {args.spectrum}  K={N_MODES}  lam in [{float(sample_l.min()):.4f},{float(sample_l.max()):.4f}]')
+    print(f'  Blocks: {sample_bs}')
 
 # ─── Checkpoint helpers ──────────────────────────────────────────────────
 def save_checkpoint(path, model, optimizer, scheduler, step, epoch, best_ppl, stats):
@@ -118,7 +172,8 @@ def save_checkpoint(path, model, optimizer, scheduler, step, epoch, best_ppl, st
             'D': D, 'VOCAB': VOCAB, 'N_MODES': N_MODES,
             'N_LAYERS': N_LAYERS, 'BATCH_SIZE': BATCH_SIZE,
             'ACCUM_STEPS': ACCUM_STEPS, 'SEQ_LEN': SEQ_LEN, 'LR': LR,
-            'EPOCHS': EPOCHS,
+            'EPOCHS': EPOCHS, 'ARCH': ARCH, 'BOTTLENECK': BOTTLENECK,
+            'SPECTRUM': args.spectrum, 'SPEC_LO': args.spec_lo, 'SPEC_HI': args.spec_hi,
         }
     }
     if scheduler is not None:
@@ -145,9 +200,9 @@ with torch.no_grad():
     bx_test = next(iter(train_loader))[0][:1]
     h = model.embed(bx_test)
     print(f'  sanity: embed range=[{h.min():.4f},{h.max():.4f}]', flush=True)
-    h = model.stack(h)
-    n, inf = torch.isnan(h).any().item(), torch.isinf(h).any().item()
-    print(f'  sanity: stack range=[{h.min():.4f},{h.max():.4f}] nan={n} inf={inf}', flush=True)
+    h, _ = model.stack(h)
+    n_val, inf_val = torch.isnan(h).any().item(), torch.isinf(h).any().item()
+    print(f'  sanity: stack range=[{h.min():.4f},{h.max():.4f}] nan={n_val} inf={inf_val}', flush=True)
     logits = model.lm_head(h)
     print(f'  sanity: logits range=[{logits.min():.4f},{logits.max():.4f}]', flush=True)
 
@@ -219,10 +274,10 @@ for epoch in range(start_epoch, EPOCHS):
             ppl = math.exp(epoch_loss / max(n_batches, 1))
             lr_now = optimizer.param_groups[0]['lr']
             v_info = ''
-            if model.stack.cfg.learnable_V:
+            if ARCH == 'ld' and hasattr(model.stack, 'cfg') and model.stack.cfg.learnable_V:
                 norms = [l.V_cay_A.norm().item() + l.V_cay_B.norm().item()
-                         for l in model.stack.layers if l.V_cay_A is not None]
-                v_info = f' |A+B|≈[{", ".join(f"{n:.2f}" for n in norms)}]'
+                         for l in model.stack.layers if hasattr(l, 'V_cay_A') and l.V_cay_A is not None]
+                v_info = f' |A+B|~[{", ".join(f"{n:.2f}" for n in norms)}]'
             print(f'  Step {step:5d} | loss={epoch_loss/max(n_batches,1):.4f} | ppl={ppl:.1f} | lr={lr_now:.2e}{v_info}')
 
     # Flush accumulated gradients at epoch end
@@ -242,20 +297,24 @@ for epoch in range(start_epoch, EPOCHS):
 
     model.eval()
     eval_loss = 0.0
-    all_entropies = []
+    all_gate_info = []
     with torch.no_grad():
         for bx, by in eval_loader:
-            logits, gates = model(bx, return_gates=True)
+            if ARCH == 'ld':
+                logits, gates = model(bx, return_gates=True)
+                H = -(gates * (gates + 1e-10).log()).sum(dim=-1).mean(dim=(1, 2))
+                all_gate_info.append(H)
+            else:
+                logits = model(bx)
             loss = F.cross_entropy(logits.reshape(-1, VOCAB), by.reshape(-1))
             eval_loss += loss.item()
-            # gates: (n_layers, B, L, K) → entropy per layer
-            H = -(gates * (gates + 1e-10).log()).sum(dim=-1).mean(dim=(1, 2))
-            all_entropies.append(H)
     eval_ppl = math.exp(eval_loss / len(eval_loader))
-    avg_entropy = torch.stack(all_entropies).mean(dim=0).cpu().tolist()
-    max_entropy = math.log(N_MODES)
-    print(f'  Gate entropy per layer: {[f"{e:.3f}" for e in avg_entropy]}')
-    print(f'  Max possible H={max_entropy:.3f}, mean H={sum(avg_entropy)/len(avg_entropy):.3f}')
+
+    if ARCH == 'ld' and all_gate_info:
+        avg_entropy = torch.stack(all_gate_info).mean(dim=0).cpu().tolist()
+        max_entropy = math.log(N_MODES)
+        print(f'  Gate entropy per layer: {[f"{e:.3f}" for e in avg_entropy]}')
+        print(f'  Max possible H={max_entropy:.3f}, mean H={sum(avg_entropy)/len(avg_entropy):.3f}')
 
     print(f'>> Epoch {epoch+1}: train_ppl={train_ppl:.1f}, eval_ppl={eval_ppl:.1f}')
     is_best = eval_ppl < best_ppl
