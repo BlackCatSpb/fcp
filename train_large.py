@@ -17,7 +17,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {DEVICE}')
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data', default='token_stream.npy')
+parser.add_argument('--data', default='token_stream.bin')
 parser.add_argument('--seq_len', type=int, default=1024)
 parser.add_argument('--batch_size', type=int, default=2)
 parser.add_argument('--accum_steps', type=int, default=16)
@@ -66,7 +66,7 @@ if not os.path.exists(DATA_PATH):
 
 print(f'Loading {DATA_PATH}...')
 t0 = time.perf_counter()
-arr = np.load(DATA_PATH, mmap_mode='r')
+arr = np.memmap(DATA_PATH, dtype=np.int32, mode='r')
 total_tokens = len(arr)
 n_eval_tok = min(args.eval_tokens, total_tokens // 20)
 n_train_tok = total_tokens - n_eval_tok

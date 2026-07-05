@@ -95,9 +95,13 @@ def main():
         print(f'Est .npy size: {total_tokens*4/1e9:.2f} GB')
         return
 
-    # ─── Pass 2: fill ─────────────────────────────────────────────────
-    print('\n[Pass 2/2] Tokenizing + saving...')
-    arr = np.empty(total_tokens, dtype=np.int32)
+    # ─── Pass 2: fill via memmap (no RAM spike) ────────────────────────
+    print('\n[Pass 2/2] Tokenizing + saving (memmap)...')
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'token_stream.bin')
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    arr = np.memmap(out_path, dtype=np.int32, mode='w+', shape=(total_tokens,))
     pos = 0
     t0 = time.perf_counter()
     for idx, (genre, path) in enumerate(items):
@@ -119,20 +123,13 @@ def main():
             print(f'  [{idx+1}/{total_files}] {pos//1e6:.0f}M tokens, '
                   f'{rate/1e6:.2f}M tok/s, [{genre}]')
 
+    arr.flush()
+    del arr
     elapsed = time.perf_counter() - t0
     assert pos == total_tokens, f'pos={pos} != total={total_tokens}'
-    print(f'  Done: {pos//1e6:.0f}M tokens in {elapsed:.0f}s '
-          f'({pos/elapsed/1e6:.2f}M tok/s)')
-
-    # ─── Save ─────────────────────────────────────────────────────────
-    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            'token_stream.npy')
-    print(f'\nSaving {out_path}...')
-    t0 = time.perf_counter()
-    np.save(out_path, arr)
     size_gb = os.path.getsize(out_path) / 1e9
-    print(f'  Shape: {arr.shape}, size: {size_gb:.2f} GB, '
-          f'time: {time.perf_counter()-t0:.0f}s')
+    print(f'  Done: {pos//1e6:.0f}M tokens, {size_gb:.2f} GB, '
+          f'{elapsed:.0f}s ({pos/elapsed/1e6:.2f}M tok/s)')
     print('Done.')
 
 

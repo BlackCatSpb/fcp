@@ -491,9 +491,12 @@ class MemBindBlock(torch.nn.Module):
             self.W_k_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
             self.W_q_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
         if self.cov_first_moment:
-            self.W_k_mu = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
+            if self.cov_rf:
+                self.W_k_mu = torch.nn.Parameter(torch.randn(H, cfg.cov_rf_dim, self.r) * 0.01)
+            else:
+                self.W_k_mu = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
             self.q_mu = torch.nn.Parameter(torch.randn(H, self.r, 1) * 0.01)
-            self.W_mu_mem = torch.nn.Parameter(torch.zeros(H, cfg.D))
+            self.W_mu_mem = torch.nn.Parameter(torch.randn(H, cfg.D) * 0.01)
 
         # Cognitive mirror: (disagreement @ W_u_m) * (h_norm @ W_v_m) @ W_out_m
         self.cov_mirror = cfg.cov_mirror
@@ -562,7 +565,10 @@ class MemBindBlock(torch.nn.Module):
 
         # ── First moment µ[t] = d·µ[t-1] + i·K ──
         if self.cov_first_moment:
-            K_mu = torch.einsum('bld,hdr->bhlr', h_norm, self.W_k_mu)
+            if self.cov_rf:
+                K_mu = torch.einsum('blp,hpr->bhlr', h_rf, self.W_k_mu)
+            else:
+                K_mu = torch.einsum('bld,hdr->bhlr', h_norm, self.W_k_mu)
             b_mu = K_mu * i_gate
             mu_all, final_mu_state = parallel_prefix_scan_1d(
                 a_scan, b_mu.permute(0, 2, 1, 3), mu_state)
