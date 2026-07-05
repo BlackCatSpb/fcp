@@ -60,9 +60,12 @@ class Phase2Model(torch.nn.Module):
         self.embed = torch.nn.Embedding(VOCAB, D)
         ld_cfg = LDConfig()
         ld_cfg.D = D; ld_cfg.n_layers = N_LAYERS; ld_cfg.n_modes = N_MODES
-        ld_cfg.vocab = VOCAB; ld_cfg.bottleneck = 256
+        ld_cfg.vocab = VOCAB; ld_cfg.bottleneck = 512; ld_cfg.kernel_size = 48
+        ld_cfg.weight_tying = True; ld_cfg.lm_head_bias = True
         self.stack = LDStack(ld_cfg)
-        self.lm_head = torch.nn.Linear(D, VOCAB, bias=False)
+        self.lm_head = torch.nn.Linear(D, VOCAB, bias=ld_cfg.lm_head_bias)
+        if ld_cfg.weight_tying:
+            self.lm_head.weight = self.embed.weight
 
     def forward(self, input_ids, return_gates=False, return_all=False):
         h = self.embed(input_ids)
@@ -87,32 +90,24 @@ print(f'  Step {ckpt.get("step", "?")}, epoch {ckpt.get("epoch", "?")}')
 original_forward = LDStack.forward
 
 def patched_forward(self, h, return_gates=False, return_hiddens=False,
-                    force_depth=None):
+                    context=None):
     gates_list = [] if (return_gates or return_hiddens) else None
     hiddens_list = [] if return_hiddens else None
-    needs_gates = return_gates or self.adaptive or force_depth is not None
+
+    # Global context injection
+    if context is not None:
+        h = h + self.ctx_proj(context).unsqueeze(1)
 
     for lidx in range(self.n_layers):
         h_layer, alpha = self.layers[lidx](h, return_gates=True)
         h_norm = rms_norm_fn(h_layer, self.final_norm_w)
         h_mlp = h_layer + self.mlps[lidx](h_norm)
 
-        if needs_gates and lidx < self.n_layers - 1:
-            spread = alpha.std(dim=-1)
-            threshold = torch.sigmoid(self.depth_logits[lidx]) if self.adaptive else 0.0
-            if force_depth is not None:
-                continue_mask = (force_depth > lidx).float()
-            elif self.adaptive:
-                if self.training:
-                    beta = 5.0
-                    continue_weight = torch.sigmoid(beta * (spread - threshold))
-                    w = continue_weight.unsqueeze(-1)
-                    h = w * h_mlp + (1 - w) * h
-                else:
-                    continue_mask = (spread > threshold).float().unsqueeze(-1)
-                    h = continue_mask * h_mlp + (1 - continue_mask) * h
-            else:
-                h = h_mlp
+        # Adaptive gain: all tokens always pass, scaled by gate decisiveness
+        if self.adaptive_gain and lidx < self.n_layers - 1:
+            gain = alpha.std(dim=-1, keepdim=True).expand(-1, -1, 1)
+            gain = gain.clamp(0.0, 1.0)
+            h = h + gain * (h_mlp - h)
         else:
             h = h_mlp
 
@@ -196,7 +191,7 @@ td:first-child, th:first-child {{ text-align: left; }}
 '''
     for k in range(data['K']):
         html += f'<th>m{k}</th>'
-    html += '<th>Entropy</th><th>Spread</th><th>Pass%</th><th>Visual</th></tr>\n'
+    html += '<th>Entropy</th><th>Spread</th><th>Gain>0.5</th><th>Visual</th></tr>\n'
     total_w = 120
     for lidx in range(data['n_layers']):
         row = g[lidx]
@@ -282,8 +277,8 @@ print()
 gate_means = gates_np.mean(axis=(1, 2))  # (L, K)
 gates_spread = [gates_np[lidx].std(axis=-1).mean() for lidx in range(N_LAYERS)]
 
-print(f'  {"Layer":>6} | {"Mode weights (avg)":>30} | {"Entropy":>8} | {"Spread":>8} | {"Pass%":>6}')
-print(f'  {"-"*6}-+-{"-"*30}-+-{"-"*8}-+-{"-"*8}-+-{"-"*6}')
+print(f'  {"Layer":>6} | {"Mode weights (avg)":>30} | {"Entropy":>8} | {"Spread":>8} | {"Gain>0.5":>8}')
+print(f'  {"-"*6}-+-{"-"*30}-+-{"-"*8}-+-{"-"*8}-+-{"-"*8}')
 max_ent = math.log(N_MODES)
 pass_rates = []
 for lidx in range(N_LAYERS):
@@ -291,14 +286,14 @@ for lidx in range(N_LAYERS):
     gate_str = ' '.join(f'{g:.3f}' for g in gate_avg)
     H = -(gate_avg * np.log(gate_avg + 1e-10)).sum()
     spread = gates_spread[lidx]
-    if lidx < N_LAYERS - 1 and hasattr(model.stack, 'depth_logits'):
-        thresh = torch.sigmoid(model.stack.depth_logits[lidx]).item()
+    if lidx < N_LAYERS - 1:
+        thresh = 0.5  # gain threshold (adaptive gain clamps to [0, 1])
         pr = (gates_np[lidx].std(axis=-1).mean(axis=-1) > thresh).mean()
     else:
         thresh = 0
         pr = 1.0
     pass_rates.append(pr)
-    print(f'  L{lidx:>3}   | {gate_str:>30} | {H:.3f}/{max_ent:.3f} | {spread:.4f} | {pr*100:>4.0f}%')
+    print(f'  L{lidx:>3}   | {gate_str:>30} | {H:.3f}/{max_ent:.3f} | {spread:.4f} | {pr*100:>6.0f}%')
 
 print()
 

@@ -14,7 +14,7 @@ class Phase2Model(nn.Module):
         self.embed = nn.Embedding(VOCAB, D)
         cfg = LDConfig()
         cfg.D = D; cfg.n_layers = N_LAYERS; cfg.n_modes = N_MODES
-        cfg.vocab = VOCAB; cfg.bottleneck = 256
+        cfg.vocab = VOCAB; cfg.bottleneck = 512
         self.stack = LDStack(cfg)
         self.lm_head = nn.Linear(D, VOCAB, bias=False)
     def forward(self, x):

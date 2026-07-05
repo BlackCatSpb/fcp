@@ -1,4 +1,4 @@
-"""Verify pipeline integration: learnable_V + adaptive_depth default."""
+"""Verify pipeline integration: learnable_V + adaptive_gain + global_context."""
 import torch, sys, numpy as np
 sys.path.insert(0, '.')
 from ld_model.core import LDConfig, LDStack
@@ -8,11 +8,12 @@ D, VOCAB, N_MODES, N_LAYERS = 896, 50000, 4, 6
 
 cfg = LDConfig()
 cfg.D = D; cfg.n_layers = N_LAYERS; cfg.n_modes = N_MODES
-cfg.vocab = VOCAB; cfg.bottleneck = 256
-cfg.adaptive_depth = True
+cfg.vocab = VOCAB; cfg.bottleneck = 512
+cfg.adaptive_gain = True
+cfg.use_global_context = True
 
 print(f'Defaults: learnable_V={cfg.learnable_V}, V_rank={cfg.V_rank}')
-print(f'Defaults: adaptive_depth={cfg.adaptive_depth}, thresholds={cfg.depth_threshold_low}-{cfg.depth_threshold_high}')
+print(f'Defaults: adaptive_gain={cfg.adaptive_gain}, global_context={cfg.use_global_context}')
 
 class Model(torch.nn.Module):
     def __init__(self):

@@ -9,7 +9,7 @@ print(f'Device: {DEVICE}')
 cfg = LDConfig()
 cfg.D = 256; cfg.n_layers = 4; cfg.n_modes = 4; cfg.vocab = 10000
 cfg.bottleneck = 64; cfg.adaptive_depth = False
-cfg.learnable_V = True; cfg.V_rank = 8
+cfg.learnable_V = True; cfg.V_rank = 16
 
 model = LDStack(cfg).to(DEVICE)
 opt = torch.optim.Adam(model.parameters(), lr=1e-3)

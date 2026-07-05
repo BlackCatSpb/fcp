@@ -43,7 +43,7 @@ class Phase2Model(torch.nn.Module):
         self.embed = torch.nn.Embedding(vocab_size, D)
         cfg = LDConfig()
         cfg.D = D; cfg.n_layers = N_LAYERS; cfg.n_modes = N_MODES
-        cfg.vocab = vocab_size; cfg.bottleneck = 256
+        cfg.vocab = vocab_size; cfg.bottleneck = 512
         self.stack = LDStack(cfg)
         self.lm_head = torch.nn.Linear(D, vocab_size, bias=False)
         self._init_weights()

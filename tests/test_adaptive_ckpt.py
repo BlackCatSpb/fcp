@@ -1,4 +1,4 @@
-"""Verify adaptive depth works with the actual checkpoint model."""
+"""Verify adaptive gain works with the actual checkpoint model."""
 import torch, sys, numpy as np
 sys.path.insert(0, '.')
 from ld_model.core import LDConfig, LDStack
@@ -9,10 +9,8 @@ D, VOCAB, N_MODES, N_LAYERS = 896, 50000, 4, 12
 
 cfg = LDConfig()
 cfg.D = D; cfg.n_layers = N_LAYERS; cfg.n_modes = N_MODES
-cfg.vocab = VOCAB; cfg.bottleneck = 256
-cfg.adaptive_depth = True
-cfg.depth_threshold_low = 0.08
-cfg.depth_threshold_high = 0.20
+cfg.vocab = VOCAB; cfg.bottleneck = 512
+cfg.adaptive_gain = True
 
 class Phase2Model(nn.Module):
     def __init__(self):
@@ -55,16 +53,8 @@ with torch.no_grad():
 print(f'Output: {h_out.shape}')
 print(f'Gates:  {gates.shape}')
 
-print(f'\n=== Adaptive depth on checkpoint model ===')
-N = x.shape[0] * x.shape[1]
+print(f'\n=== Adaptive gain on checkpoint model ===')
 for lidx in range(N_LAYERS):
     spread = gates[lidx].std(dim=-1)
-    n_cont = 0
-    if lidx < N_LAYERS - 1:
-        thresh = torch.sigmoid(model.stack.depth_logits[lidx]).item()
-        n_cont = (spread > thresh).sum().item()
-        print(f'  Layer {lidx}: spread={spread.mean():.3f} thresh={thresh:.3f} continue={n_cont}/{N}')
-    else:
-        print(f'  Layer {lidx}: spread={spread.mean():.3f} (final)')
-
-print(f'Thresholds: {[f"{torch.sigmoid(model.stack.depth_logits[i]).item():.3f}" for i in range(N_LAYERS-1)]}')
+    gain = spread.mean().item()
+    print(f'  Layer {lidx}: spread={spread.mean():.3f} gain={gain:.3f}')

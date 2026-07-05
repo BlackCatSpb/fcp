@@ -27,7 +27,7 @@ class LDBlockOriginal(torch.nn.Module):
         self.register_buffer('V', V_init)
         self.register_buffer('V_T', V_init.T.contiguous())
         self.W_gate = torch.nn.Parameter(torch.randn(cfg.D, cfg.n_modes) * 0.01)
-        self.b_gate = torch.nn.Parameter(torch.randn(cfg.n_modes) * 0.01)
+        self.b_gate = torch.nn.Parameter(torch.zeros(cfg.n_modes))
         self.register_buffer('lambda_k', lambda_roots[:cfg.n_modes])
         self.register_buffer('input_ln_w', torch.ones(cfg.D))
 
@@ -39,9 +39,9 @@ class LDBlockOriginal(torch.nn.Module):
         gate_logits = gate_logits * 4.0
         alpha = torch.softmax(gate_logits, dim=-1)
         lambda_alpha = self.lambda_k * alpha
-        lambda_eff = lambda_alpha.repeat_interleave(self.block_size, dim=-1)
         h_proj = h_norm @ self.V_T
-        h_scaled = h_proj * lambda_eff
+        h_proj_r = h_proj.view(B, L, self.K, self.block_size)
+        h_scaled = (h_proj_r * lambda_alpha.unsqueeze(-1)).reshape(B, L, self.D)
         delta = h_scaled @ self.V_T.T
         h_out = h + delta if residual else delta
         if return_gates:
@@ -76,9 +76,7 @@ class LDBlockSpectral(torch.nn.Module):
         alpha = torch.softmax(self.tau * max_abs, dim=-1)
 
         lambda_alpha = self.lambda_k * alpha
-        lambda_eff = lambda_alpha.repeat_interleave(self.block_size, dim=-1)
-
-        h_scaled = h_V * lambda_eff
+        h_scaled = (h_V_blocks * lambda_alpha.unsqueeze(-1)).reshape(B, L, self.D)
         delta = h_scaled @ self.V_T.T
 
         if residual:
@@ -98,7 +96,7 @@ class Phase2Model(torch.nn.Module):
         self.embed = torch.nn.Embedding(VOCAB, D)
         cfg = LDConfig()
         cfg.D = D; cfg.n_layers = N_LAYERS; cfg.n_modes = N_MODES
-        cfg.vocab = VOCAB; cfg.bottleneck = 256
+        cfg.vocab = VOCAB; cfg.bottleneck = 512
         lambda_roots = fibonacci_roots(N_MODES + 1)
         self.stack = LDStack(cfg)
         # Replace each LDBlock with the experimental one
@@ -216,14 +214,14 @@ if __name__ == '__main__':
         print()
         print('--- Spectral Linf gates (tau=%d) ---' % tau)
         cfg = LDConfig()
-        cfg.D = D; cfg.n_layers = N_LAYERS; cfg.n_modes = N_MODES; cfg.vocab = VOCAB; cfg.bottleneck = 256
+        cfg.D = D; cfg.n_layers = N_LAYERS; cfg.n_modes = N_MODES; cfg.vocab = VOCAB; cfg.bottleneck = 512
         lambda_roots = fibonacci_roots(N_MODES + 1)
         class Phase2ModelFlex(torch.nn.Module):
             def __init__(self, block_cls, **kwargs):
                 super().__init__()
                 self.embed = torch.nn.Embedding(VOCAB, D)
                 c = LDConfig()
-                c.D = D; c.n_layers = N_LAYERS; c.n_modes = N_MODES; c.vocab = VOCAB; c.bottleneck = 256
+                c.D = D; c.n_layers = N_LAYERS; c.n_modes = N_MODES; c.vocab = VOCAB; c.bottleneck = 512
                 lr = fibonacci_roots(N_MODES + 1)
                 self.stack = LDStack(c)
                 self.stack.layers = torch.nn.ModuleList([

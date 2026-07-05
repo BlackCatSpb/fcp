@@ -10,7 +10,7 @@ D, VOCAB, N_MODES, N_LAYERS = 896, 50000, 4, 6
 
 cfg = LDConfig()
 cfg.D = D; cfg.n_layers = N_LAYERS; cfg.n_modes = N_MODES
-cfg.vocab = VOCAB; cfg.bottleneck = 256
+cfg.vocab = VOCAB; cfg.bottleneck = 512
 cfg.adaptive_depth = False
 cfg.learnable_V = True; cfg.V_rank = 16
 
