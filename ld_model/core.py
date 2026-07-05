@@ -37,6 +37,9 @@ class LDConfig:
     spectrum_type: str = 'fib_root'  # 'fib_root', 'fib_seq', 'fib_ratio', 'linear', 'hybrid'
     spec_lo: float = 0.8   # lower bound for λ range
     spec_hi: float = 1.8   # upper bound for λ range
+    # DCT / λ-sliding
+    dct_basis: bool = False      # replace random orthogonal V with DCT-II
+    lambda_sliding: bool = False # scale λ per layer: lower=fast, upper=slow
 
 
 # ─── Fibonacci roots ────────────────────────────────────────────────────
@@ -73,6 +76,8 @@ def compute_spectrum(cfg: LDConfig) -> tuple:
     if cfg.spectrum_type == 'fib_root':
         lambda_roots = fibonacci_roots(K + 1)
         block_sizes = [D // K] * K
+        diff = D - sum(block_sizes)
+        block_sizes[-1] += diff
         return lambda_roots, block_sizes
 
     elif cfg.spectrum_type == 'fib_seq':
@@ -96,11 +101,15 @@ def compute_spectrum(cfg: LDConfig) -> tuple:
         mn, mx = min(ratios), max(ratios)
         lambdas = lo + (lambdas - mn) / (mx - mn) * (hi - lo) * 0.9999 if mx != mn else torch.full_like(lambdas, (lo + hi) / 2)
         block_sizes = [D // K] * K
+        diff = D - sum(block_sizes)
+        block_sizes[-1] += diff
         return lambdas, block_sizes
 
     elif cfg.spectrum_type == 'linear':
         lambdas = torch.linspace(lo, hi * 0.9999, K)
         block_sizes = [D // K] * K
+        diff = D - sum(block_sizes)
+        block_sizes[-1] += diff
         return lambdas, block_sizes
 
     elif cfg.spectrum_type == 'hybrid':
@@ -113,6 +122,8 @@ def compute_spectrum(cfg: LDConfig) -> tuple:
         lambdas_l = torch.linspace(lo, hi * 0.9999, K)
         lambdas = (lambdas_r + lambdas_l) / 2
         block_sizes = [D // K] * K
+        diff = D - sum(block_sizes)
+        block_sizes[-1] += diff
         return lambdas, block_sizes
 
     else:
@@ -128,6 +139,22 @@ def random_orthogonal(D: int, n_reflections: int | None = None) -> torch.Tensor:
         u = u / (u.norm() + 1e-10)
         V = V - 2 * torch.outer(V @ u, u)
     return V
+
+
+def dct_basis(D: int) -> torch.Tensor:
+    """DCT-II matrix: orthonormal rows, zero extra params."""
+    n = torch.arange(D, dtype=torch.float32)
+    k = torch.arange(D, dtype=torch.float32).unsqueeze(1)
+    V = torch.cos(math.pi / D * k * (n + 0.5))
+    V[0] *= 1.0 / math.sqrt(2)
+    V /= math.sqrt(D / 2)
+    return V
+
+
+def slide_lambda(lambda_k: torch.Tensor, layer_idx: int, n_layers: int) -> torch.Tensor:
+    """Scale lambda from 0.5x (layer 0) to 1.5x (layer n-1)."""
+    t = layer_idx / max(n_layers - 1, 1)
+    return lambda_k * (0.5 + t)
 
 
 # ─── RMS Norm ───────────────────────────────────────────────────────────
@@ -357,7 +384,13 @@ class MemBindBlock(torch.nn.Module):
         self.D = cfg.D
         self.K = cfg.n_modes
         self.block_size = cfg.D // cfg.n_modes
-        self.block_sizes = block_sizes if block_sizes else [self.block_size] * self.K
+        if block_sizes is None:
+            bs = [self.block_size] * self.K
+            diff = self.D - sum(bs)
+            bs[-1] += diff
+            self.block_sizes = bs
+        else:
+            self.block_sizes = block_sizes
         self.H = cfg.cov_heads
         self.r = cfg.cov_r
         bind_r = cfg.bind_r
@@ -365,9 +398,14 @@ class MemBindBlock(torch.nn.Module):
         self.conv = CausalConv1d(cfg.D, kernel_size=cfg.kernel_size,
                                  trainable=cfg.trainable_conv)
         self.register_buffer('ln_w', torch.ones(cfg.D))
-        V_init = random_orthogonal(cfg.D, n_reflections=32)
+        if cfg.dct_basis:
+            V_init = dct_basis(cfg.D)
+        else:
+            V_init = random_orthogonal(cfg.D, n_reflections=32)
         self.register_buffer('V', V_init)
         self.register_buffer('V_T', V_init.T.contiguous())
+        if cfg.lambda_sliding:
+            lambda_roots = slide_lambda(lambda_roots, layer_idx, cfg.n_layers)
         self.register_buffer('lambda_k', lambda_roots)
         self.register_buffer('block_sizes_t', torch.tensor(self.block_sizes, dtype=torch.long))
 
@@ -381,9 +419,9 @@ class MemBindBlock(torch.nn.Module):
         self.W_k = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
         self.W_q = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
         self.W_i = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
-        self.b_i = torch.nn.Parameter(torch.zeros(H, 1))
+        self.b_i = torch.nn.Parameter(torch.full((H, 1), 1.0))  # i_gate ≈ e^1 ≈ 2.7
         self.W_decay = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
-        self.b_decay = torch.nn.Parameter(torch.full((H, 1), 2.0))
+        self.b_decay = torch.nn.Parameter(torch.full((H, 1), 4.0))  # τ ≈ 55
         self.W_read = torch.nn.Parameter(torch.randn(H, self.r, cfg.D) * 0.01)
         self.W_mem2v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
 

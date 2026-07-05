@@ -190,3 +190,11 @@ eva/websearch/eva_web_search_cache/
 eva/memory/fractal_torch_storage/unified_memory/
 stable_branch/
 eva_ai/gui/eva_gui_cache/sessions.json
+
+# EVA-Ai (separate project, not MemBind)
+/eva_ai/
+
+# Russian corpus data
+/main-russian/
+/corpus_temp/
+*.npy
