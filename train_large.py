@@ -38,6 +38,13 @@ parser.add_argument('--spec_lo', type=float, default=0.8)
 parser.add_argument('--spec_hi', type=float, default=1.8)
 parser.add_argument('--dct', action='store_true', help='Use DCT basis')
 parser.add_argument('--slide', action='store_true', help='Use lambda sliding')
+parser.add_argument('--no-first-moment', action='store_true', dest='no_first_moment', default=False, help='Disable first moment mu[t]')
+parser.add_argument('--no-rf', action='store_true', dest='no_rf', default=False, help='Disable random features for covariance')
+parser.add_argument('--rf_dim', type=int, default=64, help='Random feature dimension')
+parser.add_argument('--no-multi-tau', action='store_true', dest='no_multi_tau', default=False, help='Disable multi-timescale heads (single tau=55)')
+parser.add_argument('--tau-lo', type=int, default=3, dest='tau_lo', help='Fastest head tau')
+parser.add_argument('--tau-hi', type=int, default=200, dest='tau_hi', help='Slowest head tau')
+parser.add_argument('--no-mirror', action='store_true', dest='no_mirror', default=False, help='Disable cognitive mirror')
 args = parser.parse_args()
 
 D = args.d_model
@@ -132,6 +139,13 @@ cfg.spec_lo = args.spec_lo
 cfg.spec_hi = args.spec_hi
 cfg.dct_basis = args.dct
 cfg.lambda_sliding = args.slide
+cfg.cov_first_moment = not args.no_first_moment
+cfg.cov_rf = not args.no_rf
+cfg.cov_rf_dim = args.rf_dim
+cfg.cov_multi_timescale = not args.no_multi_tau
+cfg.cov_tau_lo = args.tau_lo
+cfg.cov_tau_hi = args.tau_hi
+cfg.cov_mirror = not args.no_mirror
 
 
 class Phase2Model(nn.Module):

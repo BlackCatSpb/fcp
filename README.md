@@ -28,6 +28,25 @@ train.bat --spectrum linear --n_modes 16
 Get-Content training_fibseq.log -Tail 10 -Wait
 ```
 
+## Архитектурные нововведения (Jul 2026)
+
+Все включены по умолчанию, отключаются через `--no-*` флаги:
+
+| Фича | Флаг отключения | Суть |
+|------|-----------------|------|
+| **Multi-timescale heads** | `--no-multi-tau` | 4 головы с τ=[3, 12, 49, 200] frozen. Каждая специализируется на своём горизонте. |
+| **Random Features** | `--no-rf` | D→64→16 через frozen R_fixed. Ёмкость k в 4× больше в тех же 16×16. |
+| **First Moment µ** | `--no-first-moment` | µ[t]=d·µ[t-1]+i·k. Знак/смещение, который теряет Σ = k·kᵀ. Ёмкость 16×16 ×2. |
+| **Cognitive Mirror** | `--no-mirror` | std(head_out) → bind-коррекция. Модель смотрит на собственные multi-head выходы. |
+
+```powershell
+# Полная конфигурация (все фичи включены)
+python train_large.py --dct --slide
+
+# Без зеркала и первого момента (отладка)
+python train_large.py --dct --slide --no-mirror --no-first-moment
+```
+
 ---
 
 ## Ключевые характеристики

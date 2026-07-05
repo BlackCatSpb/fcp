@@ -40,6 +40,16 @@ class LDConfig:
     # DCT / λ-sliding
     dct_basis: bool = False      # replace random orthogonal V with DCT-II
     lambda_sliding: bool = False # scale λ per layer: lower=fast, upper=slow
+    # Covariance memory enhancements
+    cov_first_moment: bool = True   # track µ[t] = d·µ[t-1] + i·K alongside Σ[t]
+    cov_rf: bool = True             # random features D→p→r (richer K in same 16×16)
+    cov_rf_dim: int = 64            # random feature dimension p
+    # Multi-timescale heads
+    cov_multi_timescale: bool = True # per-head τ spectrum (instead of single τ=55)
+    cov_tau_lo: int = 3             # fastest head τ
+    cov_tau_hi: int = 200           # slowest head τ
+    # Cognitive mirror: disagreement across heads → correction via bind
+    cov_mirror: bool = True
 
 
 # ─── Fibonacci roots ────────────────────────────────────────────────────
@@ -369,6 +379,42 @@ def parallel_prefix_scan(a, b, state=None):
     return M, M[:, -1]
 
 
+def parallel_prefix_scan_1d(a, b, state=None):
+    """
+    v[t] = a[t]·v[t-1] + b[t],  v[-1] = state (or 0)
+    a: (B, L, H) decays
+    b: (B, L, H, r) increments
+    state: (B, H, r) or None
+    Returns: (v_all, final_state)
+    """
+    L = a.shape[1]
+    A = a.unsqueeze(-1)
+    v = b.clone()
+    stride = 1
+    while stride < L:
+        A_left, A_right = A[:, :L-stride], A[:, stride:]
+        v_left, v_right = v[:, :L-stride], v[:, stride:]
+        A_combined = A_left * A_right
+        v_combined = A_right * v_left + v_right
+        A = torch.cat([A[:, :stride], A_combined], dim=1)
+        v = torch.cat([v[:, :stride], v_combined], dim=1)
+        stride *= 2
+    if state is not None:
+        v = v + A * state.unsqueeze(1)
+    return v, v[:, -1]
+
+
+def compute_timescales(cfg: LDConfig) -> torch.Tensor:
+    """Per-head τ values, log-spaced between tau_lo and tau_hi."""
+    H = cfg.cov_heads
+    lo, hi = cfg.cov_tau_lo, cfg.cov_tau_hi
+    if not cfg.cov_multi_timescale or lo == hi:
+        return torch.full((H,), 55.0)
+    log_lo, log_hi = math.log(lo), math.log(hi)
+    log_tau = torch.linspace(log_lo, log_hi, H)
+    return torch.exp(log_tau).float()
+
+
 # ─── MemBindBlock: multi-head covariance memory + bind feedback ─────────
 
 class MemBindBlock(torch.nn.Module):
@@ -376,6 +422,9 @@ class MemBindBlock(torch.nn.Module):
     Один слой MemBind: conv → norm → bind → covariance scan → bind enhance → spectral.
 
     State seq: (cov_state, conv_state) для инкрементального инференса.
+    Включает опционально:
+      - cov_first_moment: µ[t] = d·µ[t-1] + i·K  (+0 FLOPs)
+      - cov_rf: random features D → p → r  (ёмкость ×4 в тех же 16×16)
     Полное описание: LAMBDA_ARCHITECTURE.md
     """
     def __init__(self, cfg: LDConfig, layer_idx: int, lambda_roots: torch.Tensor,
@@ -421,9 +470,38 @@ class MemBindBlock(torch.nn.Module):
         self.W_i = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
         self.b_i = torch.nn.Parameter(torch.full((H, 1), 1.0))  # i_gate ≈ e^1 ≈ 2.7
         self.W_decay = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
-        self.b_decay = torch.nn.Parameter(torch.full((H, 1), 4.0))  # τ ≈ 55
+        # Per-head decay: single τ=55 or multi-timescale spectrum
+        if cfg.cov_multi_timescale:
+            tau = compute_timescales(cfg)  # (H,) τ values
+            d = 1.0 - 1.0 / tau
+            b_decay_init = -torch.log(1.0 / d - 1.0)  # logit(d) → σ(b) = d
+            self.register_buffer('b_decay', b_decay_init.view(H, 1).float())
+        else:
+            self.register_buffer('b_decay', torch.full((H, 1), 4.0))  # τ ≈ 55, frozen
         self.W_read = torch.nn.Parameter(torch.randn(H, self.r, cfg.D) * 0.01)
         self.W_mem2v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
+
+        # Covariance memory enhancements
+        self.cov_first_moment = cfg.cov_first_moment
+        self.cov_rf = cfg.cov_rf
+        if self.cov_rf:
+            p = cfg.cov_rf_dim
+            R = torch.randn(cfg.D, p) / math.sqrt(cfg.D)
+            self.register_buffer('R_frozen', R)
+            self.W_k_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
+            self.W_q_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
+        if self.cov_first_moment:
+            self.W_k_mu = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
+            self.q_mu = torch.nn.Parameter(torch.randn(H, self.r, 1) * 0.01)
+            self.W_mu_mem = torch.nn.Parameter(torch.zeros(H, cfg.D))
+
+        # Cognitive mirror: (disagreement @ W_u_m) * (h_norm @ W_v_m) @ W_out_m
+        self.cov_mirror = cfg.cov_mirror
+        if self.cov_mirror:
+            self.W_u_m = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
+            self.W_v_m = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
+            self.W_out_m = torch.nn.Parameter(torch.randn(bind_r, cfg.D) * 0.01)
+            self.mirror_scale = torch.nn.Parameter(torch.tensor(0.1))
 
     def forward(self, h: torch.Tensor, state: tuple | None = None) -> tuple:
         B, L, D = h.shape
@@ -431,9 +509,13 @@ class MemBindBlock(torch.nn.Module):
 
         K = self.conv.kernel_size
         cov_state = None
+        mu_state = None
         conv_state = None
         if state is not None:
-            cov_state, conv_state = state
+            if self.cov_first_moment:
+                cov_state, mu_state, conv_state = state
+            else:
+                cov_state, conv_state = state
         if conv_state is None:
             conv_state = torch.zeros(B, self.D, K - 1, device=h.device, dtype=h.dtype)
 
@@ -443,8 +525,14 @@ class MemBindBlock(torch.nn.Module):
         u = h_norm @ self.W_u
         v = h_norm @ self.W_v
 
-        K = torch.einsum('bld,hdr->bhlr', h_norm, self.W_k)
-        Q = torch.einsum('bld,hdr->bhlr', h_norm, self.W_q)
+        # Covariance keys/queries (with optional random features)
+        if self.cov_rf:
+            h_rf = h_norm @ self.R_frozen  # (B, L, p)
+            K = torch.einsum('blp,hpr->bhlr', h_rf, self.W_k_rf)
+            Q = torch.einsum('blp,hpr->bhlr', h_rf, self.W_q_rf)
+        else:
+            K = torch.einsum('bld,hdr->bhlr', h_norm, self.W_k)
+            Q = torch.einsum('bld,hdr->bhlr', h_norm, self.W_q)
 
         i_raw = torch.einsum('bld,hdi->bhli', h_norm, self.W_i) + self.b_i.view(1, H, 1, 1)
         i_gate = torch.exp(i_raw)
@@ -464,6 +552,25 @@ class MemBindBlock(torch.nn.Module):
         mem_D = torch.einsum('blhr,hro->blho', mem_r, self.W_read)
         mem_sum = mem_D.sum(dim=2)
 
+        # ── Cognitive mirror: disagreement across heads → correction via bind ──
+        if self.cov_mirror:
+            disagreement = mem_D.std(dim=2)  # (B, L, D)
+            u_m = disagreement @ self.W_u_m
+            v_m = h_norm @ self.W_v_m
+            mirror_delta = (u_m * v_m) @ self.W_out_m
+            mem_sum = mem_sum + mirror_delta * self.mirror_scale
+
+        # ── First moment µ[t] = d·µ[t-1] + i·K ──
+        if self.cov_first_moment:
+            K_mu = torch.einsum('bld,hdr->bhlr', h_norm, self.W_k_mu)
+            b_mu = K_mu * i_gate
+            mu_all, final_mu_state = parallel_prefix_scan_1d(
+                a_scan, b_mu.permute(0, 2, 1, 3), mu_state)
+            mu_read = torch.einsum('blhr,hrf->blhf', mu_all, self.q_mu).squeeze(-1)
+            mem_sum = mem_sum + mu_read @ self.W_mu_mem
+        else:
+            final_mu_state = None
+
         v_enh = v + (mem_sum @ self.W_mem2v)
         h_adapt = h_norm + (u * v_enh) @ self.W_out
 
@@ -476,6 +583,8 @@ class MemBindBlock(torch.nn.Module):
             h_scaled = torch.cat([b * lam for b, lam in zip(h_blocks, self.lambda_k)], dim=-1)
         delta_spec = h_scaled @ self.V
 
+        if self.cov_first_moment:
+            return h + delta_spec, (final_cov_state, final_mu_state, conv_state_out)
         return h + delta_spec, (final_cov_state, conv_state_out)
 
 

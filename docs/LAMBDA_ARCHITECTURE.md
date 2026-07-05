@@ -162,7 +162,28 @@ d_h = sigmoid(h_norm @ W_decay_h + b_decay_h)  # decay в (0, 1)
 - **Key k_h:** кодирует текущий токен в r-мерное пространство для ковариации
 - **Query q_h:** запрос к памяти — извлекает информацию из ковариационной матрицы
 - **Impulse i_h = exp(⋅):** определяет, сколько новой информации записывается. В отличие от sigmoid (насыщение в 0/1), экспонента не насыщается — может пропустить любое количество информации.
-- **Decay d_h = sigmoid(⋅):** скорость забывания. b_decay инициализирован 2.0 → d ≈ 0.88 (τ ≈ 8 токенов). Обучается.
+- **Decay d_h = sigmoid(⋅):** скорость забывания. b_i = 1.0 (i_gate ≈ 2.7).
+
+**Multi-timescale heads.** Каждая из H=4 голов имеет свой frozen decay, задающий горизонт памяти τ:
+
+| Голова | τ | d = σ(b_decay) | Назначение |
+|--------|---|-----------------|------------|
+| 0 | 3 | 0.667 | Локальные n-gram (3-5 токенов) |
+| 1 | 12 | 0.920 | Фразы и короткие паттерны |
+| 2 | 49 | 0.980 | Предложения |
+| 3 | 200 | 0.995 | Абзацы и глобальный контекст |
+
+Значения τ заморожены (register_buffer). Градиент не может их изменить — каждая голова обязана специализироваться на своём горизонте.
+
+**Random Features (cov_rf).** Проекция h_norm в r-мерное пространство k_h делается не напрямую, а через случайное замороженное бутылочное горлышко:
+
+```python
+h_rf = h_norm @ R_frozen   # D → p=64, frozen random
+k_h = einsum('blp,hpr->bhlr', h_rf, W_k_rf)  # 64 → r, learnable
+q_h = einsum('blp,hpr->bhlr', h_rf, W_q_rf)  # 64 → r, learnable
+```
+
+Это даёт каждой голове 64-мерное промежуточное представление, сжатое до r=16. Емкость ковариации 16×16 — та же, но информация в k_h богаче в 4 раза. R_frozen (D×64) фиксирован — градиент не может "схлопнуть" базис.
 
 ### 5.2 Covariance delta: k^T @ k
 
@@ -251,20 +272,71 @@ M[t] = a[t] * M[t-1] + b[t]    # O(r²), не O(L·log(L))
 
 Состояние M (96KB для 24 слоёв × 4 головы × 16×16) передаётся между шагами. Контекст неограничен — каждый новый токен просто обновляет M с весовым коэффициентом. **Никакого роста памяти или вычислений с длиной контекста.**
 
+### 5.7 First Moment (cov_first_moment)
+
+Наряду со вторым моментом Σ[t] = d·Σ[t-1] + i·(k@kᵀ), модель отслеживает **первый момент**:
+
+```
+µ[t] = d·µ[t-1] + i·k
+```
+
+где µ ∈ ℝʳ — скользящее среднее проекций k. Чтение: `µ_read = q_µ @ µ`, где q_µ ∈ ℝʳ⁻¹ — обучаемый параметр (64 числа на слой). Результат добавляется к mem_sum перед bind.
+
+**Зачем?** Второй момент (ковариация) теряет знак — k·kᵀ одинаков для k и -k. Первый момент сохраняет направление: положительные и отрицательные компоненты k разделяются. Это удваивает ёмкость 16×16 без увеличения r.
+
+### 5.8 Parallel prefix scan для векторов
+
+Для первого момента используется `parallel_prefix_scan_1d` — тот же Hillis-Steele, но для (H, r)-векторов вместо (H, r, r)-матриц:
+
+```python
+def parallel_prefix_scan_1d(a, b, state=None):
+    # v[t] = a[t]·v[t-1] + b[t]
+    # a: (B, L, H), b: (B, L, H, r), state: (B, H, r)
+```
+
+FLOPs: O(L·H·r) против O(L·H·r²) для ковариации — накладные расходы < 1%.
+
 ---
 
-## 6. Компонент 4: Bind Enhancement (Memory → Bind feedback)
+## 6. Компонент 4: Bind Enhancement (Memory → Bind feedback + Cognitive Mirror)
 
 **Назначение:** feedback от ковариационной памяти к bind-адаптации.
 
+### 6.1 Consensus read (bind enhancement)
+
 ```python
 v_enh = v + (mem_sum @ W_mem2v)     # (B, L, bind_r)
-h_bind = (u * v_enh) @ W_out        # (B, L, D)
 ```
 
-Память модулирует bind: `v` (из нормализованного входа) усиливается прочитанным из памяти содержимым (`W_mem2v`). Это создаёт цикл: **память → bind → спектр**, где спектр оперирует над состоянием, модифицированным bind, который сам усилен памятью.
+Память модулирует bind: `v` усиливается прочитанным из памяти содержимым.
 
-**W_mem2v** ∈ ℝ^{D × bind_r} — дополнительный обучаемый слой, проектирующий прочитанную память в пространство bind.
+**W_mem2v** ∈ ℝ^{D × bind_r} — проекция mem_sum в пространство bind.
+
+### 6.2 Cognitive Mirror
+
+**Назначение:** модель "смотрит" на собственные multi-head выходы и корректирует себя, если головы расходятся.
+
+После чтения каждой головы из Σ получается H разных D-мерных векторов. Если все головы согласны — std(head_out) ≈ 0, зеркало молчит. Если головы расходятся — std(head_out) > 0, зеркало активируется:
+
+```python
+head_out = einsum('blhr,hro->blho', mem_r, W_read)  # (B, L, H, D)
+
+# Consensus
+mem_sum = head_out.sum(dim=2)  # (B, L, D)
+
+# Mirror: disagreement → correction via bind
+disagreement = head_out.std(dim=2)           # (B, L, D) — std across heads
+u_m = disagreement @ W_u_m                   # (B, L, bind_r)
+v_m = h_norm @ W_v_m                         # (B, L, bind_r)
+mirror_delta = (u_m * v_m) @ W_out_m         # (B, L, D)
+mem_sum = mem_sum + mirror_delta * mirror_scale
+```
+
+**Ключевое:** зеркало использует **тот же bind-механизм** (u * v @ W_out), что и основная модель. Единственное отличие — вход для u_m — disagreement, а не h_norm. Никаких новых операций, никаких softmax.
+
+**Параметры:** W_u_m, W_v_m ∈ ℝ^{D × bind_r}, W_out_m ∈ ℝ^{bind_r × D}, mirror_scale — скаляр. Всего 3·D·bind_r + 1 ≈ 43K — менее 2% слоя при D=896.
+
+**Когнитивный эффект:** если heads с разными τ (3, 12, 49, 200) дают разные ответы, модель видит конфликт между коротким и длинным контекстом. Зеркало превращает этот спор в коррекцию скрытого состояния — без внешнего модуля, без softmax arbitration.
 
 ---
 
@@ -344,25 +416,37 @@ h_mlp = self.down(silu(self.up(h_layer)))   # D → bottleneck → D
 ## 9. Полный forward pass MemBindBlock
 
 ```
-Вход: h (B, L, D), state = (M_prev, conv_buf) or None
-──────────────────────────────────────────────────────
+Вход: h (B, L, D), state = (M_prev, µ_prev, conv_buf) or None
+──────────────────────────────────────────────────────────────
 1. h_conv, conv_buf ← CausalConv1d(h, conv_buf)
 2. h_norm ← rms_norm(h + h_conv)
 3. u, v ← h_norm @ W_u, h_norm @ W_v
 4. Для каждой головы h = 1..H:
-   k ← h_norm @ W_k_h     (Key)
-   q ← h_norm @ W_q_h     (Query)
-   i ← exp(h_norm @ W_i_h + b_i_h)     (Impulse gate)
-   d ← sigmoid(h_norm @ W_decay_h + b_decay_h)     (Decay gate)
-   Δ ← i · (k^T @ k)                     (Covariance delta)
-   M_all, M_new ← parallel_prefix_scan(d, Δ, M_prev_h)
-   mem ← q @ M_all @ W_read_h             (Memory read)
-5. v_enh ← v + Σ_h mem @ W_mem2v          (Bind enhancement)
-6. h_adapt ← h_norm + (u * v_enh) @ W_out
-7. Δ_spec ← V · diag(λ) · V^T · h_adapt   (Spectral transform)
-8. h_out ← h + Δ_spec                     (Residual)
-──────────────────────────────────────────────────────
-Выход: h_out (B, L, D), state = (M_new, conv_buf)
+   h_rf ← h_norm @ R_frozen               (Random Features, D→p=64)
+   k ← einsum('blp,hpr→bhlr', h_rf, W_k_rf)   (Key, 64→r)
+   q ← einsum('blp,hpr→bhlr', h_rf, W_q_rf)   (Query, 64→r)
+   i ← exp(einsum(·) + b_i)                (Impulse gate, b_i=1.0)
+   d ← sigmoid(einsum(·) + b_decay_h)      (Decay gate, τ frozen per head)
+   Δ_Σ ← i · (k^T @ k)                     (Second moment delta, r×r)
+   Δ_µ ← i · k                              (First moment delta, r)
+   M_all, M_new ← parallel_prefix_scan(d, Δ_Σ, M_prev_h)   (Cov scan)
+   µ_all, µ_new ← parallel_prefix_scan_1d(d, Δ_µ, µ_prev_h) (1st moment)
+   mem ← q @ M_all @ W_read_h               (Memory read: Σ)
+   mem_mu ← q_µ @ µ_all                     (Memory read: µ)
+5. head_out = Σ_h [mem @ W_read_h + mem_mu]
+   mem_sum = head_out.sum(dim=2)             (Consensus over heads)
+6. Cognitive Mirror (если heads disagree):
+   disagreement ← head_out.std(dim=2)        (std across H heads)
+   u_m ← disagreement @ W_u_m                (Mirror u)
+   v_m ← h_norm @ W_v_m                      (Mirror v)
+   mirror_delta ← (u_m * v_m) @ W_out_m      (Mirror correction)
+   mem_sum += mirror_delta * mirror_scale
+7. v_enh ← v + mem_sum @ W_mem2v             (Bind enhancement)
+8. h_adapt ← h_norm + (u * v_enh) @ W_out
+9. Δ_spec ← V · diag(λ) · V^T · h_adapt     (Spectral transform)
+10. h_out ← h + Δ_spec                       (Residual)
+──────────────────────────────────────────────────────────────
+Выход: h_out (B, L, D), state = (M_new, µ_new, conv_buf)
 ```
 
 ---
