@@ -65,42 +65,66 @@ def main():
     total_files = len(items)
     print(f'Files: {total_files}')
 
-    # ─── Pass 1: count tokens per file ────────────────────────────────
-    print('\n[Pass 1/2] Counting tokens...')
-    token_counts = []
-    t0 = time.perf_counter()
-    for idx, (genre, path) in enumerate(items):
-        try:
-            with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                raw = f.read()
-        except Exception as e:
-            print(f'\n  [WARN] {genre}/{os.path.basename(path)}: {e}')
-            token_counts.append(0)
-            continue
-        text = clean_text(raw)
-        n_tok = len(tokenizer.encode(text).ids)
-        token_counts.append(n_tok)
-        if (idx + 1) % 500 == 0:
-            elapsed = time.perf_counter() - t0
-            rate = (idx + 1) / elapsed
-            print(f'  [{idx+1}/{total_files}] {rate:.0f} files/s, '
-                  f'[{genre}] {n_tok//1e3:.0f}K tok')
-    elapsed = time.perf_counter() - t0
-    total_tokens = sum(token_counts)
-    print(f'  Done: {total_tokens//1e6:.0f}M tokens from {total_files} files '
-          f'in {elapsed:.0f}s ({total_tokens/elapsed/1e6:.2f}M tok/s)')
+    # ─── Pass 1: count tokens (or load cached) ────────────────────────
+    count_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'token_counts.npy')
+    if os.path.exists(count_path):
+        print('\n[Pass 1/2] Loading cached token counts...')
+        token_counts = np.load(count_path).tolist()
+        total_tokens = sum(token_counts)
+        print(f'  {total_files} files, {total_tokens//1e6:.0f}M tokens')
+    else:
+        print('\n[Pass 1/2] Counting tokens...')
+        token_counts = []
+        t0 = time.perf_counter()
+        for idx, (genre, path) in enumerate(items):
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    raw = f.read()
+            except Exception as e:
+                print(f'\n  [WARN] {genre}/{os.path.basename(path)}: {e}')
+                token_counts.append(0)
+                continue
+            text = clean_text(raw)
+            n_tok = len(tokenizer.encode(text).ids)
+            token_counts.append(n_tok)
+            if (idx + 1) % 500 == 0:
+                elapsed = time.perf_counter() - t0
+                rate = (idx + 1) / elapsed
+                print(f'  [{idx+1}/{total_files}] {rate:.0f} files/s, '
+                      f'[{genre}] {n_tok//1e3:.0f}K tok')
+        elapsed = time.perf_counter() - t0
+        total_tokens = sum(token_counts)
+        print(f'  Done: {total_tokens//1e6:.0f}M tokens from {total_files} files '
+              f'in {elapsed:.0f}s ({total_tokens/elapsed/1e6:.2f}M tok/s)')
+        # Save counts for resume
+        np.save(count_path, np.array(token_counts, dtype=np.int32))
 
     if args.dry_run:
         print(f'\nSEQ_LEN={SEQ_LEN}: ~{total_tokens//SEQ_LEN//1e6:.0f}M windows')
-        print(f'Est .npy size: {total_tokens*4/1e9:.2f} GB')
+        print(f'Est .bin size: {total_tokens*4/1e9:.2f} GB')
         return
 
-    # ─── Pass 2: fill via memmap (no RAM spike) ────────────────────────
-    print('\n[Pass 2/2] Tokenizing + saving (memmap)...')
+    # ─── Pass 2: fill via memmap ──────────────────────────────────────
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             'token_stream.bin')
+    resume_pos = 0
     if os.path.exists(out_path):
-        os.remove(out_path)
+        # Check if partially complete
+        existing = os.path.getsize(out_path)
+        if existing == total_tokens * 4:
+            print(f'\n[Pass 2/2] {out_path} already complete ({existing/1e9:.1f} GB)')
+            print('Done.')
+            return
+        else:
+            # Count how many tokens already written
+            existing_arr = np.memmap(out_path, dtype=np.int32, mode='r')
+            # Find first non-zero... actually just redo from scratch
+            print(f'\n[Pass 2/2] Incomplete {out_path} ({existing/1e9:.1f} GB), redoing...')
+            del existing_arr
+            os.remove(out_path)
+
+    print('\n[Pass 2/2] Tokenizing + saving (memmap)...')
     arr = np.memmap(out_path, dtype=np.int32, mode='w+', shape=(total_tokens,))
     pos = 0
     t0 = time.perf_counter()
