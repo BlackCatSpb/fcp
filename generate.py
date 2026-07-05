@@ -32,13 +32,14 @@ class Phase2Model(torch.nn.Module):
         return self.lm_head(h), new_state
 
 def load_model(path, recurrent=False):
-    model = Phase2Model(recurrent=recurrent).to(DEVICE)
-    ckpt = torch.load(path, map_location=DEVICE, weights_only=True)
+    model = Phase2Model(recurrent=recurrent)
+    # Load on CPU, extract only model weights — avoids pulling optimizer states onto GPU
+    ckpt = torch.load(path, map_location='cpu', weights_only=True)
     sd = ckpt.get('model_state_dict') or ckpt.get('model') or ckpt.get('model_fp16', ckpt)
     if sd is ckpt.get('model_fp16', None):
         sd = {k: v.float() if v.dtype==torch.float16 else v for k,v in sd.items()}
     model.load_state_dict(sd, strict=False)
-    model.eval()
+    model.to(DEVICE).eval()
     return model
 
 @torch.no_grad()

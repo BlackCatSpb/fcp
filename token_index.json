@@ -1,0 +1,10 @@
+{
+  "ACTION": {
+    "file": "token_stream_ACTION.bin",
+    "length": 549111184
+  },
+  "DETECT": {
+    "file": "token_stream_DETECT.bin",
+    "length": 880726623
+  }
+}

@@ -50,6 +50,36 @@ class LDConfig:
     cov_tau_hi: int = 200           # slowest head τ
     # Cognitive mirror: disagreement across heads → correction via bind
     cov_mirror: bool = True
+    # Unified factorization: V_shared (D×K) + W_code (K×d_out) for all weights
+    factorized: bool = False
+    factorized_K: int = 24  # Zeckendorf levels for V=50000 (F_24=46368)
+
+
+# ─── Zeckendorf utilities ──────────────────────────────────────────────────
+
+def fibonacci_bases(vocab_size: int) -> list[int]:
+    """Fibonacci numbers F_1..F_K covering vocab_size (F_{K+1} > vocab_size)."""
+    fibs = [1, 2]
+    while fibs[-1] < vocab_size:
+        fibs.append(fibs[-1] + fibs[-2])
+    return fibs
+
+def zeckendorf_codes(vocab_size: int) -> torch.Tensor:
+    """(V, K) binary Zeckendorf matrix, no consecutive 1s."""
+    fibs = fibonacci_bases(vocab_size)
+    K = len(fibs)
+    E = torch.zeros(vocab_size, K, dtype=torch.float32)
+    for i in range(vocab_size):
+        remaining, prev = i, False
+        for j, f in enumerate(reversed(fibs)):
+            bit = 1 if remaining >= f and not prev else 0
+            E[i, K - 1 - j] = bit
+            if bit:
+                remaining -= f
+                prev = True
+            else:
+                prev = False
+    return E
 
 
 # ─── Fibonacci roots ────────────────────────────────────────────────────
@@ -428,13 +458,13 @@ class MemBindBlock(torch.nn.Module):
     Полное описание: LAMBDA_ARCHITECTURE.md
     """
     def __init__(self, cfg: LDConfig, layer_idx: int, lambda_roots: torch.Tensor,
-                 block_sizes: list | None = None):
+                 block_sizes: list | None = None, V_shared: torch.nn.Parameter | None = None):
         super().__init__()
         self.D = cfg.D
-        self.K = cfg.n_modes
+        self.n_modes = cfg.n_modes
         self.block_size = cfg.D // cfg.n_modes
         if block_sizes is None:
-            bs = [self.block_size] * self.K
+            bs = [self.block_size] * self.n_modes
             diff = self.D - sum(bs)
             bs[-1] += diff
             self.block_sizes = bs
@@ -443,74 +473,239 @@ class MemBindBlock(torch.nn.Module):
         self.H = cfg.cov_heads
         self.r = cfg.cov_r
         bind_r = cfg.bind_r
+        self.factorized = cfg.factorized
 
         self.conv = CausalConv1d(cfg.D, kernel_size=cfg.kernel_size,
                                  trainable=cfg.trainable_conv)
         self.register_buffer('ln_w', torch.ones(cfg.D))
-        if cfg.dct_basis:
-            V_init = dct_basis(cfg.D)
-        else:
-            V_init = random_orthogonal(cfg.D, n_reflections=32)
-        self.register_buffer('V', V_init)
-        self.register_buffer('V_T', V_init.T.contiguous())
-        if cfg.lambda_sliding:
-            lambda_roots = slide_lambda(lambda_roots, layer_idx, cfg.n_layers)
-        self.register_buffer('lambda_k', lambda_roots)
-        self.register_buffer('block_sizes_t', torch.tensor(self.block_sizes, dtype=torch.long))
 
-        # Bind adaptation (FCF-inspired u*v interaction, no gates)
-        self.W_u = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
-        self.W_v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
-        self.W_out = torch.nn.Parameter(torch.randn(bind_r, cfg.D) * 0.01)
+        # ─── Unified basis (factorized) ───
+        if self.factorized:
+            self.V_shared = V_shared  # D×K, shared across all layers
+            K = cfg.factorized_K
+            # Compute lambda_k for K modes
+            cfg_k = LDConfig()
+            cfg_k.n_modes = K
+            cfg_k.D = cfg.D
+            cfg_k.spectrum_type = cfg.spectrum_type
+            cfg_k.spec_lo = cfg.spec_lo
+            cfg_k.spec_hi = cfg.spec_hi
+            lambda_k_fact, _ = compute_spectrum(cfg_k)
+            if cfg.lambda_sliding:
+                lambda_k_fact = slide_lambda(lambda_k_fact, layer_idx, cfg.n_layers)
+            self.register_buffer('lambda_k', lambda_k_fact)
+            self.register_buffer('block_sizes_t', torch.zeros(K, dtype=torch.long))
 
-        # Multi-head covariance memory
-        H = self.H
-        self.W_k = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
-        self.W_q = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
-        self.W_i = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
-        self.b_i = torch.nn.Parameter(torch.full((H, 1), 1.0))  # i_gate ≈ e^1 ≈ 2.7
-        self.W_decay = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
-        # Per-head decay: single τ=55 or multi-timescale spectrum
-        if cfg.cov_multi_timescale:
-            tau = compute_timescales(cfg)  # (H,) τ values
-            d = 1.0 - 1.0 / tau
-            b_decay_init = -torch.log(1.0 / d - 1.0)  # logit(d) → σ(b) = d
-            self.register_buffer('b_decay', b_decay_init.view(H, 1).float())
-        else:
-            self.register_buffer('b_decay', torch.full((H, 1), 4.0))  # τ ≈ 55, frozen
-        self.W_read = torch.nn.Parameter(torch.randn(H, self.r, cfg.D) * 0.01)
-        self.W_mem2v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
+            # Factorized weights: all D×W → K×W, all W×D → W×K
+            self.W_u_code = torch.nn.Parameter(torch.randn(K, bind_r) * 0.01)
+            self.W_v_code = torch.nn.Parameter(torch.randn(K, bind_r) * 0.01)
+            self.W_out_code = torch.nn.Parameter(torch.randn(bind_r, K) * 0.01)
 
-        # Covariance memory enhancements
-        self.cov_first_moment = cfg.cov_first_moment
-        self.cov_rf = cfg.cov_rf
-        if self.cov_rf:
-            p = cfg.cov_rf_dim
-            R = torch.randn(cfg.D, p) / math.sqrt(cfg.D)
-            self.register_buffer('R_frozen', R)
-            self.W_k_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
-            self.W_q_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
-        if self.cov_first_moment:
+            H = self.H
+            # Covariance keys (K-dim): RF-based or K-based
+            self.cov_rf = cfg.cov_rf
             if self.cov_rf:
-                self.W_k_mu = torch.nn.Parameter(torch.randn(H, cfg.cov_rf_dim, self.r) * 0.01)
+                p = cfg.cov_rf_dim
+                R = torch.randn(K, p) / math.sqrt(K)
+                self.register_buffer('R_frozen', R)
+                self.W_k_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
+                self.W_q_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
             else:
-                self.W_k_mu = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
-            self.q_mu = torch.nn.Parameter(torch.randn(H, self.r, 1) * 0.01)
-            self.W_mu_mem = torch.nn.Parameter(torch.randn(H, cfg.D) * 0.01)
+                self.W_k_code = torch.nn.Parameter(torch.randn(H, K, self.r) * 0.01)
+                self.W_q_code = torch.nn.Parameter(torch.randn(H, K, self.r) * 0.01)
 
-        # Cognitive mirror: (disagreement @ W_u_m) * (h_norm @ W_v_m) @ W_out_m
-        self.cov_mirror = cfg.cov_mirror
-        if self.cov_mirror:
-            self.W_u_m = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
-            self.W_v_m = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
-            self.W_out_m = torch.nn.Parameter(torch.randn(bind_r, cfg.D) * 0.01)
-            self.mirror_scale = torch.nn.Parameter(torch.tensor(0.1))
+            self.W_i_code = torch.nn.Parameter(torch.randn(H, K) * 0.01)
+            self.b_i = torch.nn.Parameter(torch.full((H, 1), 1.0))
+            self.W_decay_code = torch.nn.Parameter(torch.randn(H, K) * 0.01)
+            if cfg.cov_multi_timescale:
+                tau = compute_timescales(cfg)
+                d = 1.0 - 1.0 / tau
+                b_decay_init = -torch.log(1.0 / d - 1.0)
+                self.register_buffer('b_decay', b_decay_init.view(H, 1).float())
+            else:
+                self.register_buffer('b_decay', torch.full((H, 1), 4.0))
+            self.W_read_code = torch.nn.Parameter(torch.randn(H, self.r, K) * 0.01)
+            self.W_mem2v_code = torch.nn.Parameter(torch.randn(K, bind_r) * 0.01)
+
+            # Covariance memory enhancements
+            self.cov_first_moment = cfg.cov_first_moment
+            if self.cov_first_moment:
+                if self.cov_rf:
+                    self.W_k_mu = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
+                else:
+                    self.W_k_mu_code = torch.nn.Parameter(torch.randn(H, K, self.r) * 0.01)
+                self.q_mu = torch.nn.Parameter(torch.randn(H, self.r, 1) * 0.01)
+                self.W_mu_mem_code = torch.nn.Parameter(torch.randn(H, K) * 0.01)
+
+            # Mirror (in K-dim)
+            self.cov_mirror = cfg.cov_mirror
+            if self.cov_mirror:
+                self.W_u_m_code = torch.nn.Parameter(torch.randn(K, bind_r) * 0.01)
+                self.W_v_m_code = torch.nn.Parameter(torch.randn(K, bind_r) * 0.01)
+                self.W_out_m_code = torch.nn.Parameter(torch.randn(bind_r, K) * 0.01)
+                self.mirror_scale = torch.nn.Parameter(torch.tensor(0.1))
+
+            # Factorized conv weight (optional)
+            self.conv_factorized = cfg.trainable_conv  # factorize conv only if trainable
+            if self.conv_factorized:
+                self.conv_W_code = torch.nn.Parameter(
+                    torch.randn(K, cfg.kernel_size) * 0.1)
+        # ─── Standard (non-factorized) ───
+        else:
+            if cfg.dct_basis:
+                V_init = dct_basis(cfg.D)
+            else:
+                V_init = random_orthogonal(cfg.D, n_reflections=32)
+            self.register_buffer('V', V_init)
+            self.register_buffer('V_T', V_init.T.contiguous())
+            if cfg.lambda_sliding:
+                lambda_roots = slide_lambda(lambda_roots, layer_idx, cfg.n_layers)
+            self.register_buffer('lambda_k', lambda_roots)
+            self.register_buffer('block_sizes_t', torch.tensor(self.block_sizes, dtype=torch.long))
+
+            self.W_u = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
+            self.W_v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
+            self.W_out = torch.nn.Parameter(torch.randn(bind_r, cfg.D) * 0.01)
+
+            H = self.H
+            self.W_k = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
+            self.W_q = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
+            self.W_i = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
+            self.b_i = torch.nn.Parameter(torch.full((H, 1), 1.0))
+            self.W_decay = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
+            if cfg.cov_multi_timescale:
+                tau = compute_timescales(cfg)
+                d = 1.0 - 1.0 / tau
+                b_decay_init = -torch.log(1.0 / d - 1.0)
+                self.register_buffer('b_decay', b_decay_init.view(H, 1).float())
+            else:
+                self.register_buffer('b_decay', torch.full((H, 1), 4.0))
+            self.W_read = torch.nn.Parameter(torch.randn(H, self.r, cfg.D) * 0.01)
+            self.W_mem2v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
+
+            self.cov_first_moment = cfg.cov_first_moment
+            self.cov_rf = cfg.cov_rf
+            if self.cov_rf:
+                p = cfg.cov_rf_dim
+                R = torch.randn(cfg.D, p) / math.sqrt(cfg.D)
+                self.register_buffer('R_frozen', R)
+                self.W_k_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
+                self.W_q_rf = torch.nn.Parameter(torch.randn(H, p, self.r) * 0.01)
+            if self.cov_first_moment:
+                if self.cov_rf:
+                    self.W_k_mu = torch.nn.Parameter(torch.randn(H, cfg.cov_rf_dim, self.r) * 0.01)
+                else:
+                    self.W_k_mu = torch.nn.Parameter(torch.randn(H, cfg.D, self.r) * 0.01)
+                self.q_mu = torch.nn.Parameter(torch.randn(H, self.r, 1) * 0.01)
+                self.W_mu_mem = torch.nn.Parameter(torch.randn(H, cfg.D) * 0.01)
+
+            self.cov_mirror = cfg.cov_mirror
+            if self.cov_mirror:
+                self.W_u_m = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
+                self.W_v_m = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
+                self.W_out_m = torch.nn.Parameter(torch.randn(bind_r, cfg.D) * 0.01)
+                self.mirror_scale = torch.nn.Parameter(torch.tensor(0.1))
 
     def forward(self, h: torch.Tensor, state: tuple | None = None) -> tuple:
+        if self.factorized:
+            return self._forward_factorized(h, state)
+        return self._forward_standard(h, state)
+
+    def _forward_factorized(self, h: torch.Tensor, state: tuple | None = None) -> tuple:
+        """Factorized forward: all ops in K-dim, project at boundaries."""
+        B, L, D = h.shape
+        H, r = self.H, self.r
+        K = self.V_shared.shape[1]
+
+        conv_k = self.conv.kernel_size
+        cov_state = mu_state = conv_state = None
+        if state is not None:
+            if self.cov_first_moment:
+                cov_state, mu_state, conv_state = state
+            else:
+                cov_state, conv_state = state
+        if conv_state is None:
+            conv_state = torch.zeros(B, D, conv_k - 1, device=h.device, dtype=h.dtype)
+
+        # Conv stays in D-dim
+        h_conv, conv_state_out = self.conv(h, conv_state)
+        h_norm = rms_norm(h + h_conv, self.ln_w)
+
+        # Project to K-dim
+        V = self.V_shared
+        hp = h_norm @ V  # (B, L, K)
+
+        # Bind in K-dim
+        u = hp @ self.W_u_code
+        v = hp @ self.W_v_code
+
+        # Covariance keys/queries
+        if self.cov_rf:
+            h_rf = hp @ self.R_frozen  # (B, L, p)
+            K_val = torch.einsum('blp,hpr->bhlr', h_rf, self.W_k_rf)
+            Q = torch.einsum('blp,hpr->bhlr', h_rf, self.W_q_rf)
+        else:
+            K_val = torch.einsum('blk,hkr->bhlr', hp, self.W_k_code)
+            Q = torch.einsum('blk,hkr->bhlr', hp, self.W_q_code)
+
+        i_raw = torch.einsum('blk,hk->bhl', hp, self.W_i_code) + self.b_i.view(1, H, 1)
+        i_gate = torch.exp(i_raw)
+
+        decay_raw = torch.einsum('blk,hk->bhl', hp, self.W_decay_code) + self.b_decay.view(1, H, 1)
+        decay = torch.sigmoid(decay_raw)
+
+        K_e = K_val.unsqueeze(-1)
+        delta = (K_e @ K_e.transpose(-2, -1)) * i_gate.unsqueeze(-1).unsqueeze(-1)
+
+        a_scan = decay.permute(0, 2, 1)
+        b_scan = delta.permute(0, 2, 1, 3, 4)
+        M_all, final_cov_state = parallel_prefix_scan(a_scan, b_scan, cov_state)
+
+        Q_perm = Q.permute(0, 2, 1, 3)
+        mem_r = (Q_perm.unsqueeze(-2) @ M_all).squeeze(-2)
+        mem_D = torch.einsum('blhr,hrk->blhk', mem_r, self.W_read_code)
+        mem_sum = mem_D.sum(dim=2)  # (B, L, K)
+
+        # Mirror (in K-dim)
+        if self.cov_mirror:
+            disagreement = mem_D.std(dim=2)  # (B, L, K)
+            u_m = disagreement @ self.W_u_m_code
+            v_m = hp @ self.W_v_m_code
+            mirror_delta = (u_m * v_m) @ self.W_out_m_code
+            mem_sum = mem_sum + mirror_delta * self.mirror_scale
+
+        # First moment
+        if self.cov_first_moment:
+            if self.cov_rf:
+                K_mu = torch.einsum('blp,hpr->bhlr', h_rf, self.W_k_mu)
+            else:
+                K_mu = torch.einsum('blk,hkr->bhlr', hp, self.W_k_mu_code)
+            b_mu = K_mu * i_gate.unsqueeze(-1)
+            mu_all, final_mu_state = parallel_prefix_scan_1d(
+                a_scan, b_mu.permute(0, 2, 1, 3), mu_state)
+            mu_read = torch.einsum('blhr,hrf->blhf', mu_all, self.q_mu).squeeze(-1)
+            mem_sum = mem_sum + (mu_read @ self.W_mu_mem_code)
+        else:
+            final_mu_state = None
+
+        # Bind enhance (K-dim)
+        v_enh = v + (mem_sum @ self.W_mem2v_code)
+        h_adapt_proj = hp + (u * v_enh) @ self.W_out_code
+
+        # Spectral in K-dim (no block partitioning)
+        h_scaled = h_adapt_proj * self.lambda_k.view(1, 1, -1)
+        delta_spec = h_scaled @ V.T  # (B, L, D)
+
+        if self.cov_first_moment:
+            return h + delta_spec, (final_cov_state, final_mu_state, conv_state_out)
+        return h + delta_spec, (final_cov_state, conv_state_out)
+
+    def _forward_standard(self, h: torch.Tensor, state: tuple | None = None) -> tuple:
+        """Original non-factorized forward pass."""
         B, L, D = h.shape
         H, r = self.H, self.r
 
-        K = self.conv.kernel_size
+        conv_k = self.conv.kernel_size
         cov_state = None
         mu_state = None
         conv_state = None
@@ -520,7 +715,7 @@ class MemBindBlock(torch.nn.Module):
             else:
                 cov_state, conv_state = state
         if conv_state is None:
-            conv_state = torch.zeros(B, self.D, K - 1, device=h.device, dtype=h.dtype)
+            conv_state = torch.zeros(B, self.D, conv_k - 1, device=h.device, dtype=h.dtype)
 
         h_conv, conv_state_out = self.conv(h, conv_state)
         h_norm = rms_norm(h + h_conv, self.ln_w)
@@ -528,13 +723,12 @@ class MemBindBlock(torch.nn.Module):
         u = h_norm @ self.W_u
         v = h_norm @ self.W_v
 
-        # Covariance keys/queries (with optional random features)
         if self.cov_rf:
-            h_rf = h_norm @ self.R_frozen  # (B, L, p)
-            K = torch.einsum('blp,hpr->bhlr', h_rf, self.W_k_rf)
+            h_rf = h_norm @ self.R_frozen
+            K_val = torch.einsum('blp,hpr->bhlr', h_rf, self.W_k_rf)
             Q = torch.einsum('blp,hpr->bhlr', h_rf, self.W_q_rf)
         else:
-            K = torch.einsum('bld,hdr->bhlr', h_norm, self.W_k)
+            K_val = torch.einsum('bld,hdr->bhlr', h_norm, self.W_k)
             Q = torch.einsum('bld,hdr->bhlr', h_norm, self.W_q)
 
         i_raw = torch.einsum('bld,hdi->bhli', h_norm, self.W_i) + self.b_i.view(1, H, 1, 1)
@@ -543,7 +737,7 @@ class MemBindBlock(torch.nn.Module):
         decay_raw = torch.einsum('bld,hdi->bhli', h_norm, self.W_decay) + self.b_decay.view(1, H, 1, 1)
         decay = torch.sigmoid(decay_raw)
 
-        K_e = K.unsqueeze(-1)
+        K_e = K_val.unsqueeze(-1)
         delta = (K_e @ K_e.transpose(-2, -1)) * i_gate.unsqueeze(-1)
 
         a_scan = decay.squeeze(-1).permute(0, 2, 1)
@@ -555,15 +749,13 @@ class MemBindBlock(torch.nn.Module):
         mem_D = torch.einsum('blhr,hro->blho', mem_r, self.W_read)
         mem_sum = mem_D.sum(dim=2)
 
-        # ── Cognitive mirror: disagreement across heads → correction via bind ──
         if self.cov_mirror:
-            disagreement = mem_D.std(dim=2)  # (B, L, D)
+            disagreement = mem_D.std(dim=2)
             u_m = disagreement @ self.W_u_m
             v_m = h_norm @ self.W_v_m
             mirror_delta = (u_m * v_m) @ self.W_out_m
             mem_sum = mem_sum + mirror_delta * self.mirror_scale
 
-        # ── First moment µ[t] = d·µ[t-1] + i·K ──
         if self.cov_first_moment:
             if self.cov_rf:
                 K_mu = torch.einsum('blp,hpr->bhlr', h_rf, self.W_k_mu)
@@ -582,8 +774,8 @@ class MemBindBlock(torch.nn.Module):
 
         h_proj = h_adapt @ self.V_T
         if all(s == self.block_size for s in self.block_sizes):
-            h_proj_r = h_proj.view(B, L, self.K, self.block_size)
-            h_scaled = (h_proj_r * self.lambda_k.view(1, 1, self.K, 1)).reshape(B, L, self.D)
+            h_proj_r = h_proj.view(B, L, self.n_modes, self.block_size)
+            h_scaled = (h_proj_r * self.lambda_k.view(1, 1, self.n_modes, 1)).reshape(B, L, self.D)
         else:
             h_blocks = list(torch.split(h_proj, self.block_sizes, dim=-1))
             h_scaled = torch.cat([b * lam for b, lam in zip(h_blocks, self.lambda_k)], dim=-1)
@@ -602,13 +794,38 @@ class MemBindStack(torch.nn.Module):
         self.cfg = cfg
         self.D = cfg.D
         self.n_layers = cfg.n_layers
+        self.factorized = cfg.factorized
         lambda_k, block_sizes = compute_spectrum(cfg)
+
+        # Shared learnable basis for factorized weights
+        if self.factorized:
+            K = cfg.factorized_K
+            V_init = dct_basis(cfg.D)[:, :K]  # D×K (first K DCT modes)
+            self.V_shared = torch.nn.Parameter(V_init.clone())
+        else:
+            self.V_shared = None
+            self.lambda_fact = None
+
         self.layers = torch.nn.ModuleList([
-            MemBindBlock(cfg, i, lambda_k, block_sizes) for i in range(cfg.n_layers)
+            MemBindBlock(cfg, i, lambda_k if not self.factorized else None,
+                         block_sizes if not self.factorized else None,
+                         V_shared=self.V_shared)
+            for i in range(cfg.n_layers)
         ])
-        self.mlps = torch.nn.ModuleList([
-            BottleneckMLP(cfg.D, cfg.bottleneck) for _ in range(cfg.n_layers)
-        ])
+        if self.factorized:
+            K = cfg.factorized_K
+            self.mlp_up_codes = torch.nn.ParameterList([
+                torch.nn.Parameter(torch.randn(K, cfg.bottleneck) * 0.01)
+                for _ in range(cfg.n_layers)
+            ])
+            self.mlp_down_codes = torch.nn.ParameterList([
+                torch.nn.Parameter(torch.randn(cfg.bottleneck, K) * 0.01)
+                for _ in range(cfg.n_layers)
+            ])
+        else:
+            self.mlps = torch.nn.ModuleList([
+                BottleneckMLP(cfg.D, cfg.bottleneck) for _ in range(cfg.n_layers)
+            ])
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
 
     def forward(self, h: torch.Tensor, state: list | None = None) -> tuple:
@@ -617,8 +834,14 @@ class MemBindStack(torch.nn.Module):
         new_state = []
         for lidx in range(self.n_layers):
             h_layer, layer_state = self.layers[lidx](h, state[lidx])
-            h_norm_mlp = rms_norm(h_layer, self.final_norm_w)
-            h = h_layer + self.mlps[lidx](h_norm_mlp)
+            if self.factorized:
+                hp_mlp = rms_norm(h_layer, self.final_norm_w) @ self.V_shared
+                hp_mlp = torch.nn.functional.silu(hp_mlp @ self.mlp_up_codes[lidx])
+                hp_mlp = hp_mlp @ self.mlp_down_codes[lidx]
+                h = h_layer + hp_mlp @ self.V_shared.T
+            else:
+                h_norm_mlp = rms_norm(h_layer, self.final_norm_w)
+                h = h_layer + self.mlps[lidx](h_norm_mlp)
             new_state.append(layer_state)
         return rms_norm(h, self.final_norm_w), new_state
 
