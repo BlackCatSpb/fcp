@@ -1,21 +1,40 @@
 """
-test_membind.py — λ_d-MemBind: Multi-head covariance memory + bind feedback.
+test_cov_gate.py — λ_d-Cov: Bind + Covariance Memory, no softmax, no sigmoid gate.
 
-Новое:
-1. Multi-head covariance memory (4 head, r=8 каждый) — per-λ-мода память
-2. Memory feedback → enhanced bind — v_enh = v + sum(memory_readout)
-3. h_adapt = h_norm + (u * v_enh) @ W_out — bind усиленный памятью
-4. Parallel scan — O(log L)
+Три ключевые идеи из SOTA 2024-2025, объединённые в λ_d:
 
-Уникально: информация из прошлого (cov memory) напрямую модулирует
-bind-преобразование текущего токена через feedback. Цикл: память → bind → память.
+1. Bind pre-transformation (FCF → λ_d) — заменяет gate на u*v, без softmax
+2. Covariance memory (mLSTM + GLA) — матричное состояние r×r, 
+   обновляемое как M[t] = σ(W_decay·x)⊙M[t-1] + k^T⊗q
+3. Экспоненциальный input gate — i = exp(W_i·x) / (1+exp(W_i·x)) — 
+   позволяет >1 (усиление), стабилизирован нормализацией.
 
-Без softmax, без sigmoid gates, без attention.
+Архитектура:
+    h_conv = causal_conv(h)
+    h_norm = rms_norm(h + h_conv)
+    
+    # Bind adaptation (FCF-inspired, proven в BindGate)
+    u = h_norm @ W_u; v = h_norm @ W_v
+    h_adapt = h_norm + (u * v) @ W_out
+    
+    # Covariance memory
+    k = h_adapt @ W_k       # (B, r) key
+    q = h_adapt @ W_q       # (B, r) query
+    i = exp(h_adapt @ W_i)  # input gate ∈ (0, ∞)
+    M[t] = σ(d·h_norm)·M[t-1] + i·k^T⊗q
+    
+    # Memory read
+    h_mem = (q @ M[t]) @ W_read  # content-dependent retrieval
+    
+    # Spectral operator with fixed λ
+    h_total = h_adapt + h_mem      # main + memory paths
+    Δ = V · diag(λ) · V^T · h_total
+    h_out = h + Δ
 
-Запуск: python test_membind.py
+Запуск: python test_cov_gate.py
 """
 
-import math, time, itertools
+import os, sys, math, time, itertools
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,6 +46,7 @@ print(f'Device: {DEVICE}')
 if DEVICE.type == 'cuda':
     print(f'  VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB')
 
+# ─── Config ──────────────────────────────────────────────────────────────
 D = 896
 VOCAB = 50000
 N_MODES = 4
@@ -41,9 +61,8 @@ GRAD_CLIP = 1.0
 LOG_EVERY = 100
 DATA_FILE = 'russian_chunks.npy'
 N_CHUNKS = 20000
-COV_HEADS = 4    # = N_MODES, одна память на моду
-COV_R = 8        # rank per head → 4×8×8 = 256 элементов (как CovGate r=16)
-BIND_R = 16      # bind rank (как в BindGate)
+
+COV_RANK = 16  # rank of covariance memory (r × r)
 
 def fibonacci_roots(max_k=7):
     roots = []
@@ -73,30 +92,7 @@ def rms_norm(x, weight, eps=1e-6):
     return x / rms.clamp(min=eps) * weight
 
 
-# ─── Parallel prefix scan (autograd-safe) ─────────────────────────────
-def parallel_prefix_scan(a, b):
-    """
-    M[t] = a[t]·M[t-1] + b[t],  M[-1] = 0
-    a: (B, L, H) decays
-    b: (B, L, H, r, r) increments
-    Returns M: (B, L, H, r, r)
-    """
-    L = a.shape[1]
-    A = a.unsqueeze(-1).unsqueeze(-1)  # (B, L, H, 1, 1)
-    M = b
-    stride = 1
-    while stride < L:
-        A_left, A_right = A[:, :L-stride], A[:, stride:]
-        M_left, M_right = M[:, :L-stride], M[:, stride:]
-        A_combined = A_left * A_right
-        M_combined = A_right * M_left + M_right
-        A = torch.cat([A[:, :stride], A_combined], dim=1)
-        M = torch.cat([M[:, :stride], M_combined], dim=1)
-        stride *= 2
-    return M
-
-
-# ─── Components ─────────────────────────────────────────────────────────
+# ─── Shared components ──────────────────────────────────────────────────
 class CausalConv1d(nn.Module):
     def __init__(self, D, kernel_size=48):
         super().__init__()
@@ -117,136 +113,131 @@ class BottleneckMLP(nn.Module):
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# MemBindBlock — Multi-head covariance + bind feedback + spectral operator
+# CovLDBlock — Bind + Covariance Memory, no softmax/sigmoid gates
 # ═════════════════════════════════════════════════════════════════════════
-class MemBindBlock(nn.Module):
+class CovLDBlock(nn.Module):
     """
-    Цикл: память → bind → спектр.
+    Bind pre-transformation (FCF u*v) + low-rank covariance memory (mLSTM×GLA).
 
-    1. conv → norm
-    2. u = h_norm @ W_u, v = h_norm @ W_v
-    3. Multi-head covariance update (H=COV_HEADS, r=COV_R):
-       k_h = h_norm @ W_k_h, q_h = h_norm @ W_q_h
-       i_h = exp(W_i_h · h_norm), d_h = sigmoid(W_decay_h · h_norm)
-       M_h[t] = d_h·M_h[t-1] + i_h·k_h^T@k_h             (parallel scan)
-       mem_h = q_h @ M_h @ W_read_h
-    4. Enhanced bind: v_enh = v + sum_h(mem_h)
-       h_adapt = h_norm + (u * v_enh) @ W_out
-    5. Spectral: Δ = V·diag(λ)·V^T·h_adapt
-    6. h_out = h + Δ
+    Per-layer forward (per token t):
+      1. Bind adaptation:  h_adapt = h_norm + (W_u·h * W_v·h) @ W_out
+      2. Memory update:    M = decay[t] · M + i[t] · k[t]^T @ q[t]
+      3. Memory read:      h_mem = (q[t] @ M) @ W_read
+      4. Spectral oper:    Δ = V·diag(λ)·V^T · (h_adapt + h_mem)
+      5. Residual:         h_out = h + Δ
+
+    decay[t] = sigmoid(W_decay · h_norm)   — learnable per-token forget
+    i[t]     = exp(W_i · h_norm)            — exponential input gate (can be >1)
     """
-    def __init__(self, layer_idx):
+    def __init__(self, layer_idx, cov_r=16):
         super().__init__()
         self.D = D
         self.K = N_MODES
         self.block_size = D // N_MODES
-        self.H = COV_HEADS
-        self.r = COV_R
+        self.r = cov_r
 
         self.conv = CausalConv1d(D)
         self.register_buffer('ln_w', torch.ones(D))
+
         V_init = random_orthogonal(D)
         self.register_buffer('V', V_init)
         self.register_buffer('V_T', V_init.T.contiguous())
         self.register_buffer('lambda_k', LAMBDA_ROOTS)
 
-        # Bind adaptation
-        self.W_u = nn.Parameter(torch.randn(D, BIND_R) * 0.01)
-        self.W_v = nn.Parameter(torch.randn(D, BIND_R) * 0.01)
-        self.W_out = nn.Parameter(torch.zeros(BIND_R, D))
+        # 1. Bind adaptation (replaces gate)
+        self.W_u = nn.Parameter(torch.randn(D, self.r) * 0.01)
+        self.W_v = nn.Parameter(torch.randn(D, self.r) * 0.01)
+        self.W_out = nn.Parameter(torch.zeros(self.r, D))
 
-        # Multi-head covariance memory (H heads, each r-dimensional)
-        # Stack all head params for efficient matmul
-        H_heads = self.H
-        self.W_k = nn.Parameter(torch.randn(H_heads, D, self.r) * 0.01)
-        self.W_q = nn.Parameter(torch.randn(H_heads, D, self.r) * 0.01)
-        self.W_i = nn.Parameter(torch.randn(H_heads, D, 1) * 0.01)
-        self.b_i = nn.Parameter(torch.zeros(H_heads, 1))
-        self.W_decay = nn.Parameter(torch.randn(H_heads, D, 1) * 0.01)
-        self.b_decay = nn.Parameter(torch.full((H_heads, 1), 2.0))
-        self.W_read = nn.Parameter(torch.zeros(H_heads, self.r, D))
-        self.W_mem2v = nn.Parameter(torch.zeros(D, BIND_R))  # mem_sum → v_enh projection
+        # 2. Covariance memory: keys, queries, gates
+        self.W_k = nn.Parameter(torch.randn(D, self.r) * 0.01)
+        self.W_q = nn.Parameter(torch.randn(D, self.r) * 0.01)
+        self.W_i = nn.Parameter(torch.randn(D, 1) * 0.01)     # exponential input gate
+        self.b_i = nn.Parameter(torch.zeros(1))               # log(1) = 0 at init
+
+        self.W_decay = nn.Parameter(torch.randn(D, 1) * 0.01)  # forget gate
+        self.b_decay = nn.Parameter(torch.full((1,), 1.0))     # sigmoid(1) ≈ 0.73
+
+        self.W_read = nn.Parameter(torch.zeros(self.r, D))     # zero init → h_mem=0 at start
 
     def forward(self, h):
         B, L, D = h.shape
-        H, r = self.H, self.r
 
-        # 1. Conv + Norm
+        # ─── 1. Conv + Norm ────────────────────────────────────────────
         h_conv = self.conv(h)
         h_norm = rms_norm(h + h_conv, self.ln_w)
 
-        # 2. Bind projections (parallel over L)
-        u = h_norm @ self.W_u     # (B, L, BIND_R)
-        v = h_norm @ self.W_v     # (B, L, BIND_R)
+        # ─── 2. Bind adaptation (parallel over L) ───────────────────────
+        u = h_norm @ self.W_u
+        v = h_norm @ self.W_v
+        h_adapt = h_norm + (u * v) @ self.W_out
 
-        # 3. Multi-head covariance (all heads in parallel via einsum)
-        # K, Q: (B, H, L, r) — H heads × L tokens × r-dim key/query
-        K = torch.einsum('bld,hdr->bhlr', h_norm, self.W_k)  # key
-        Q = torch.einsum('bld,hdr->bhlr', h_norm, self.W_q)  # query
+        # ─── 3. Covariance memory keys/queries/gates (parallel) ────────
+        K = h_norm @ self.W_k          # (B, L, r)
+        Q = h_norm @ self.W_q          # (B, L, r)
+        i_raw = h_norm @ self.W_i + self.b_i  # (B, L, 1)
+        i_gate = torch.exp(i_raw)       # input gate ∈ (0, ∞), can amplify
 
-        i_raw = torch.einsum('bld,hdi->bhli', h_norm, self.W_i) + self.b_i.view(1, H, 1, 1)
-        i_gate = torch.exp(i_raw)  # (B, H, L, 1) — exponential input gate
+        decay = torch.sigmoid(h_norm @ self.W_decay + self.b_decay)  # (B, L, 1), ∈ (0,1)
 
-        decay_raw = torch.einsum('bld,hdi->bhli', h_norm, self.W_decay) + self.b_decay.view(1, H, 1, 1)
-        decay = torch.sigmoid(decay_raw)  # (B, H, L, 1) ∈ (0,1)
+        # ─── 4. Sequential covariance update + memory read ────────────
+        # M: (B, r, r) running covariance. Sequential over L but cheap (r×r).
+        M = torch.zeros(B, self.r, self.r, device=h.device)
+        mem_outputs = []
 
-        # Covariance increments: delta = i_gate · k^T @ k (per head, per token)
-        K_e = K.unsqueeze(-1)  # (B, H, L, r, 1)
-        delta = (K_e @ K_e.transpose(-2, -1)) * i_gate.unsqueeze(-1)  # (B, H, L, r, r)
+        for t in range(L):
+            k_t = K[:, t, :].unsqueeze(-1)   # (B, r, 1)
 
-        # Parallel scan over L: M[t] = decay[t]·M[t-1] + delta[t]
-        # Reshape for scan: a (B, L, H), b (B, L, H, r, r)
-        a_scan = decay.squeeze(-1).permute(0, 2, 1)     # (B, L, H)
-        b_scan = delta.permute(0, 2, 1, 3, 4)            # (B, L, H, r, r)
-        M_all = parallel_prefix_scan(a_scan, b_scan)     # (B, L, H, r, r)
+            # Covariance update: M = decay · M + input_gate · k^T @ k
+            # self-covariance (k^T@k) more stable than cross (k^T@q)
+            decay_t = decay[:, t, :].unsqueeze(-1)  # (B, 1, 1)
+            M = decay_t * M
+            igate_t = i_gate[:, t, :].unsqueeze(-1)  # (B, 1, 1)
+            M = M + igate_t * (k_t @ k_t.transpose(-2, -1))
+            # (B, r, 1) @ (B, 1, r) → (B, r, r)
 
-        # Memory readout: mem_h[t] = q_h[t] @ M_h[t] @ W_read_h
-        # Q: (B, H, L, r) → (B, L, H, r),  M: (B, L, H, r, r)
-        Q_perm = Q.permute(0, 2, 1, 3)    # (B, L, H, r)
-        mem_r = (Q_perm.unsqueeze(-2) @ M_all).squeeze(-2)  # (B, L, H, r)
-        mem_D = torch.einsum('blhr,hro->blho', mem_r, self.W_read)  # (B, L, H, D)
-        mem_sum = mem_D.sum(dim=2)  # (B, L, D) — aggregate over heads
+            # Memory read: h_mem = q @ M @ W_read
+            q_t_2d = Q[:, t, :]  # (B, r)
+            h_mem_t = (q_t_2d.unsqueeze(-2) @ M).squeeze(-2) @ self.W_read  # (B, D)
+            mem_outputs.append(h_mem_t)
 
-        # 4. Memory feedback → enhanced bind
-        # v_enh = v + W_mem2v · mem_sum  (memory modulates bind's v signal)
-        v_enh = v + (mem_sum @ self.W_mem2v)
+        h_mem = torch.stack(mem_outputs, dim=1)  # (B, L, D)
 
-        # h_adapt = h_norm + (u * v_enh) @ W_out
-        h_adapt = h_norm + (u * v_enh) @ self.W_out
-
-        # 5. Spectral operator (fixed λ)
-        h_proj = h_adapt @ self.V_T
+        # ─── 5. Spectral operator (parallel over L) ─────────────────────
+        h_total = h_adapt + h_mem  # main path + memory path
+        h_proj = h_total @ self.V_T
         h_proj_r = h_proj.view(B, L, self.K, self.block_size)
         h_scaled = (h_proj_r * self.lambda_k.view(1, 1, self.K, 1)).reshape(B, L, self.D)
-        delta_spec = h_scaled @ self.V
+        delta = h_scaled @ self.V
 
-        return h + delta_spec, None
+        return h + delta, None  # no gates
 
 
 # ═════════════════════════════════════════════════════════════════════════
 # Stack + Model
 # ═════════════════════════════════════════════════════════════════════════
-class MemBindStack(nn.Module):
-    def __init__(self):
+class CovLDStack(nn.Module):
+    def __init__(self, cov_r=16):
         super().__init__()
         self.register_buffer('final_norm_w', torch.ones(D))
-        self.layers = nn.ModuleList([MemBindBlock(i) for i in range(N_LAYERS)])
+        self.layers = nn.ModuleList([CovLDBlock(i, cov_r) for i in range(N_LAYERS)])
         self.mlps = nn.ModuleList([BottleneckMLP(D) for _ in range(N_LAYERS)])
 
     def forward(self, h):
         for lidx in range(N_LAYERS):
             h_layer, _ = self.layers[lidx](h)
             h_norm_mlp = rms_norm(h_layer, self.final_norm_w)
-            h = h_layer + self.mlps[lidx](h_norm_mlp)
+            h_mlp = h_layer + self.mlps[lidx](h_norm_mlp)
+            h = h_mlp  # no adaptive gain (no gates to compute it from)
         return rms_norm(h, self.final_norm_w)
 
 
-class MemBindModel(nn.Module):
-    def __init__(self):
+class CovModel(nn.Module):
+    def __init__(self, cov_r=16):
         super().__init__()
         self.embed = nn.Embedding(VOCAB, D)
         nn.init.uniform_(self.embed.weight, -1.0 / math.sqrt(D), 1.0 / math.sqrt(D))
-        self.stack = MemBindStack()
+        self.stack = CovLDStack(cov_r)
         self.lm_head = nn.Linear(D, VOCAB, bias=True)
         self.lm_head.weight = self.embed.weight
 
@@ -262,25 +253,29 @@ print(f'  {arr.shape[0]} chunks in {time.perf_counter()-t0:.1f}s')
 
 n_train = int(N_CHUNKS * 0.95)
 n_eval = N_CHUNKS - n_train
+print(f'  Train: {n_train} chunks ({n_train*SEQ_LEN/1e6:.1f}M tok)  Eval: {n_eval}')
+
 train_ids = torch.tensor(arr[:n_train], dtype=torch.long).to(DEVICE)
 eval_ids  = torch.tensor(arr[n_train:], dtype=torch.long).to(DEVICE)
+
 train_x, train_y = train_ids[:, :-1], train_ids[:, 1:]
 eval_x,  eval_y  = eval_ids[:, :-1],  eval_ids[:, 1:]
+
 train_loader = DataLoader(TensorDataset(train_x, train_y), batch_size=BATCH_SIZE, shuffle=True)
 eval_loader  = DataLoader(TensorDataset(eval_x, eval_y),  batch_size=BATCH_SIZE)
 
 # ─── Train ───────────────────────────────────────────────────────────────
 print(f'\n{"="*60}')
-print(f'Training: MEMBIND (H={COV_HEADS}, r={COV_R}, bind_r={BIND_R})')
-print(f'  Multi-head covariance + memory feedback + bind enhancement')
+print(f'Training: COV (r={COV_RANK})')
 print(f'{"="*60}')
 
-model = MemBindModel().to(DEVICE)
+model = CovModel(COV_RANK).to(DEVICE)
 n_all = sum(p.numel() for p in model.parameters())
-n_mem = sum(p.numel() for n, p in model.named_parameters() if 'W_k' in n or 'W_q' in n or 'W_i' in n or 'W_decay' in n or 'W_read' in n or 'W_mem' in n)
+n_cov = sum(p.numel() for n, p in model.named_parameters() if 'W_k' in n or 'W_q' in n or 'W_i' in n or 'W_decay' in n or 'W_read' in n)
 n_bind = sum(p.numel() for n, p in model.named_parameters() if 'W_u' in n or 'W_v' in n or 'W_out' in n)
-print(f'  Params: {n_all/1e6:.2f}M | bind: {n_bind:,} | memory: {n_mem:,}')
+print(f'  Params: {n_all/1e6:.2f}M | bind: {n_bind:,} | cov: {n_cov:,}')
 
+# Sanity
 model.eval()
 with torch.no_grad():
     bx = next(iter(train_loader))[0][:1]
@@ -323,4 +318,4 @@ while step < N_STEPS:
 
 t_total = time.perf_counter() - t_start
 print(f'\n  Done: {t_total:.0f}s, avg {(step * BATCH_SIZE * ACCUM_STEPS * SEQ_LEN / t_total):.0f} tok/s')
-print(f'  Params: {n_all/1e6:.2f}M')
+print(f'  Total params: {n_all/1e6:.2f}M')

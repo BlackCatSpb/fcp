@@ -1,8 +1,11 @@
-"""λ_d: Spectral RNN with Fibonacci spectrum + causal conv.
+"""MemBind: Multi-head covariance memory + bilinear bind + spectral operator.
+No softmax, no sigmoid gates, no attention.
 
 Архитектуры:
-  - LDBlock: sigmoid-gated spectral transform (original)
-  - MemBindBlock: multi-head covariance memory + bind feedback (next-gen, no softmax/sigmoid)
+  - MemBindBlock: multi-head covariance memory + bind feedback (основная)
+  - LDBlock: sigmoid-gated spectral transform (legacy)
+
+Полное описание: LAMBDA_ARCHITECTURE.md
 """
 
 import math
@@ -152,13 +155,23 @@ class CausalConv1d(torch.nn.Module):
             self.register_buffer('weight', w)
             self.register_buffer('bias', torch.zeros(D))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, state: torch.Tensor | None = None) -> tuple:
         x_perm = x.transpose(1, 2)
-        pad = self.kernel_size - 1
-        x_pad = F.pad(x_perm, (pad, 0))
+        k = self.kernel_size
+        if state is not None:
+            x_perm = torch.cat([state, x_perm], dim=-1)
+        x_pad = F.pad(x_perm, (k - 1, 0))
         out = F.conv1d(x_pad, self.weight, bias=self.bias,
                        groups=self.weight.shape[0])
-        return out.transpose(1, 2)
+        # out: (B, D, L_out). Without state: L_out=L.  With state: L_out=L+k-1
+        if state is not None:
+            L = x.shape[1]
+            out = out[:, :, k-1:k-1+L]
+        out = out.transpose(1, 2)
+        if state is not None:
+            new_state = x_perm[:, :, -(k - 1):]
+            return out, new_state
+        return out, None
 
 
 # ─── LDBlock: conv → rms_norm → V·Λ·Vᵀ ─────────────────────────────────
@@ -301,16 +314,19 @@ class BottleneckMLP(torch.nn.Module):
 
 # ─── Parallel prefix scan (autograd-safe, Hillis-Steele) ────────────────
 
-def parallel_prefix_scan(a, b):
+def parallel_prefix_scan(a, b, state=None):
     """
-    M[t] = a[t]·M[t-1] + b[t],  M[-1] = 0
+    M[t] = a[t]·M[t-1] + b[t],  M[-1] = state (or 0)
     a: (B, L, H) decays
     b: (B, L, H, r, r) increments
-    Returns M: (B, L, H, r, r)
+    state: (B, H, r, r) or None — initial state M[-1]
+    Returns: (M_all, final_state)
+      M_all: (B, L, H, r, r) — M[t] for each token
+      final_state: (B, H, r, r) — M[L-1], for next inference step
     """
     L = a.shape[1]
     A = a.unsqueeze(-1).unsqueeze(-1)
-    M = b
+    M = b.clone()
     stride = 1
     while stride < L:
         A_left, A_right = A[:, :L-stride], A[:, stride:]
@@ -320,26 +336,20 @@ def parallel_prefix_scan(a, b):
         A = torch.cat([A[:, :stride], A_combined], dim=1)
         M = torch.cat([M[:, :stride], M_combined], dim=1)
         stride *= 2
-    return M
+    # After scan: M[t] = recurrence from M[-1]=0, A[t] = cumprod(a[0..t])
+    if state is not None:
+        M = M + A * state.unsqueeze(1)
+    return M, M[:, -1]
 
 
 # ─── MemBindBlock: multi-head covariance memory + bind feedback ─────────
 
 class MemBindBlock(torch.nn.Module):
     """
-    Цикл: память → bind → спектр. No softmax, no sigmoid gates, no attention.
+    Один слой MemBind: conv → norm → bind → covariance scan → bind enhance → spectral.
 
-    1. conv → norm
-    2. u = h_norm @ W_u, v = h_norm @ W_v
-    3. Multi-head covariance (H heads, r per head):
-       k_h = h_norm @ W_k_h, q_h = h_norm @ W_q_h
-       i_h = exp(W_i_h · h_norm), d_h = sigmoid(W_decay_h · h_norm)
-       M_h[t] = d_h·M_h[t-1] + i_h·k_h^T@k_h   (parallel scan)
-       mem_h = q_h @ M_h @ W_read_h
-    4. Enhanced bind: v_enh = v + sum_h(mem_h)
-       h_adapt = h_norm + (u * v_enh) @ W_out
-    5. Spectral: Δ = V·diag(λ)·V^T·h_adapt
-    6. h_out = h + Δ
+    State seq: (cov_state, conv_state) для инкрементального инференса.
+    Полное описание: LAMBDA_ARCHITECTURE.md
     """
     def __init__(self, cfg: LDConfig, layer_idx: int, lambda_roots: torch.Tensor,
                  block_sizes: list | None = None):
@@ -364,7 +374,7 @@ class MemBindBlock(torch.nn.Module):
         # Bind adaptation (FCF-inspired u*v interaction, no gates)
         self.W_u = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
         self.W_v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
-        self.W_out = torch.nn.Parameter(torch.zeros(bind_r, cfg.D))
+        self.W_out = torch.nn.Parameter(torch.randn(bind_r, cfg.D) * 0.01)
 
         # Multi-head covariance memory
         H = self.H
@@ -374,14 +384,22 @@ class MemBindBlock(torch.nn.Module):
         self.b_i = torch.nn.Parameter(torch.zeros(H, 1))
         self.W_decay = torch.nn.Parameter(torch.randn(H, cfg.D, 1) * 0.01)
         self.b_decay = torch.nn.Parameter(torch.full((H, 1), 2.0))
-        self.W_read = torch.nn.Parameter(torch.zeros(H, self.r, cfg.D))
-        self.W_mem2v = torch.nn.Parameter(torch.zeros(cfg.D, bind_r))
+        self.W_read = torch.nn.Parameter(torch.randn(H, self.r, cfg.D) * 0.01)
+        self.W_mem2v = torch.nn.Parameter(torch.randn(cfg.D, bind_r) * 0.01)
 
-    def forward(self, h: torch.Tensor) -> tuple:
+    def forward(self, h: torch.Tensor, state: tuple | None = None) -> tuple:
         B, L, D = h.shape
         H, r = self.H, self.r
 
-        h_conv = self.conv(h)
+        K = self.conv.kernel_size
+        cov_state = None
+        conv_state = None
+        if state is not None:
+            cov_state, conv_state = state
+        if conv_state is None:
+            conv_state = torch.zeros(B, self.D, K - 1, device=h.device, dtype=h.dtype)
+
+        h_conv, conv_state_out = self.conv(h, conv_state)
         h_norm = rms_norm(h + h_conv, self.ln_w)
 
         u = h_norm @ self.W_u
@@ -401,7 +419,7 @@ class MemBindBlock(torch.nn.Module):
 
         a_scan = decay.squeeze(-1).permute(0, 2, 1)
         b_scan = delta.permute(0, 2, 1, 3, 4)
-        M_all = parallel_prefix_scan(a_scan, b_scan)
+        M_all, final_cov_state = parallel_prefix_scan(a_scan, b_scan, cov_state)
 
         Q_perm = Q.permute(0, 2, 1, 3)
         mem_r = (Q_perm.unsqueeze(-2) @ M_all).squeeze(-2)
@@ -420,7 +438,7 @@ class MemBindBlock(torch.nn.Module):
             h_scaled = torch.cat([b * lam for b, lam in zip(h_blocks, self.lambda_k)], dim=-1)
         delta_spec = h_scaled @ self.V
 
-        return h + delta_spec, None
+        return h + delta_spec, (final_cov_state, conv_state_out)
 
 
 # ─── MemBindStack ────────────────────────────────────────────────────────
@@ -440,12 +458,16 @@ class MemBindStack(torch.nn.Module):
         ])
         self.register_buffer('final_norm_w', torch.ones(cfg.D))
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
+    def forward(self, h: torch.Tensor, state: list | None = None) -> tuple:
+        if state is None:
+            state = [None] * self.n_layers
+        new_state = []
         for lidx in range(self.n_layers):
-            h_layer, _ = self.layers[lidx](h)
+            h_layer, layer_state = self.layers[lidx](h, state[lidx])
             h_norm_mlp = rms_norm(h_layer, self.final_norm_w)
             h = h_layer + self.mlps[lidx](h_norm_mlp)
-        return rms_norm(h, self.final_norm_w)
+            new_state.append(layer_state)
+        return rms_norm(h, self.final_norm_w), new_state
 
 
 class LDStack(torch.nn.Module):

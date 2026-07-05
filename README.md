@@ -1,52 +1,85 @@
-# FCP — Fibonacci Covariance Processor
+# MemBind: Multi-Head Covariance Memory Language Model
 
-**MemBind**: multi-head covariance memory + bilinear bind + Fibonacci spectrum.
-No softmax, no sigmoid gates, no attention, no transformers.
+**MemBind** — архитектура языка следующего поколения, заменяющая механизм внимания
+(Transformer) на **multi-head covariance memory + bilinear bind + спектральный оператор**.
+Без softmax, без sigmoid-гейтов, без attention.
 
-## Architecture
+Контекст — **∞** на 2GB GPU. Сложность — **O(D²)**, не зависит от длины последовательности.
 
-```
-MemBindBlock:
-  conv → norm → bind(u*v) + cov_memory(H heads) + spectral(V·λ·V^T)
-```
+---
 
-Three parallel content-dependent mechanisms:
-1. **Multi-head Covariance Memory** — M[t] = decay·M[t-1] + i·kᵀk, parallel scan O(log L)
-2. **Bind Adaptation (FCF-inspired)** — h_adapt = h + (u * v_enh) @ W_out, replaces all gates
-3. **γ-λ Spectral Operator** — V·diag(λ_k)·V^T, Fibonacci roots (1.618, 1.839, 1.927, 1.966)
+## Документация
 
-## Key Results (5000 steps)
+- **[LAMBDA_ARCHITECTURE.md](LAMBDA_ARCHITECTURE.md)** — полное техническое описание архитектуры
+  (12 разделов: философия, все компоненты, математика, сравнение, масштабирование)
 
-| Architecture | PPL | tok/s | vs CovGate |
-|-------------|-----|-------|------------|
-| CovGate (seq) | 438 | 260 | 100% |
-| **MemBind (this)** | **466** | **962** | **94% quality, 3.7× speed** |
+---
 
-## Current Scale: 89M params
-
-- D=896, L=24, bottleneck=896
-- H=4 covariance heads, r=16 per head
-- 108M total params (incl. frozen V matrices)
-- Fits in 2GB VRAM (MX550)
-
-## Training
+## Быстрый старт
 
 ```bash
-python train_phase2.py --arch membind --n_layers 24 --bottleneck 896 \
-  --train_chunks 20000 --epochs 10 --data russian
+# Тренировка (MemBind, fib_seq spectrum)
+train_fibseq.bat
+
+# Тренировка с произвольными параметрами
+train.bat --spectrum linear --n_modes 16
+
+# Мониторинг лога
+Get-Content training_fibseq.log -Tail 10 -Wait
 ```
 
-## Files
+---
+
+## Ключевые характеристики
+
+| Параметр | Значение |
+|----------|----------|
+| Параметры | 89.1M trainable (108.4M total) |
+| D | 896 |
+| Слои | 24 |
+| Головы памяти | 4, каждая r=16 |
+| Bind rank | 16 |
+| Спектр | fib_seq, 8 мод, λ∈[0.8, 1.8] |
+| Блоки | [10, 21, 31, 51, 82, 134, 216, 351] |
+| Длина контекста (inference) | Неограничена |
+| VRAM (inference, fp32) | ~356MB + 0 за контекст |
+| VRAM (training, B=2) | ~2.0GB |
+
+---
+
+## Структура репозитория
 
 ```
-├── ld_model/core.py          — MemBindBlock, MemBindStack, parallel_prefix_scan
-├── train_phase2.py           — training pipeline (gradient accum + warmup + cosine)
-├── analyze_architecture.py   — generates model_analysis.html
-├── test_membind.py           — original prototype (reference)
-├── russian_tokenizer/        — custom BPE tokenizer (vocab=50000)
-└── model_analysis.html       — full architecture report
+ld_model/
+  core.py          — MemBindBlock, MemBindStack, parallel_prefix_scan,
+                     LDBlock, LDStack, CausalConv1d, BottleneckMLP
+  readout.py       — Zeckendorf readout (экспериментальный)
+
+train_phase2.py   — Тренировка (--arch membind|ld)
+analyze_scaling.py  — Анализ масштабирования и FLOPs
+analyze_context.py  — Анализ контекста при 2GB
+
+*.bat             — Ярлыки для запуска тренировки
+LAMBDA_ARCHITECTURE.md — Полное описание архитектуры
 ```
 
-## License
+---
 
-MIT
+## Сравнение: MemBind vs Transformer
+
+| Характеристика | Transformer | MemBind |
+|---------------|------------|---------|
+| Сложность на токен | O(L·D) | O(D²) — константа |
+| Память контекста | O(L·D) KV cache | 96KB covariance |
+| Контекст на 2GB (D=896) | ~18K tok | ∞ |
+| Attention | QK^T + softmax | Covariance scan + bind |
+| Нелинейность | Softmax | Bilinear (u*v) |
+
+---
+
+## Требования
+
+- Python 3.12
+- PyTorch 2.x
+- GPU 2GB+ (MX550)
+- 16GB RAM

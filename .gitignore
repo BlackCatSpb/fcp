@@ -1,33 +1,192 @@
-# Byte-compiled
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
 *$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Env
-.env
-.venv
+# Virtual environments
+.venv/
 venv/
+.venv311/
+ENV/
+env/
 
-# Data files (too large for git)
-*.npy
-*.npz
-*.pth
-*.pt
-checkpoints/
-
-# Logs
-*.log
-*.err
-*.txt
+# HuggingFace cache
+**/hf_cache/
+**/.cache/huggingface/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# Jupyter checkpoints
-.ipynb_checkpoints/
+# Logs
+*.log
+logs/
+output_log.txt
+test_generation_integration.log
+system_selftest.log
+
+# Cache directories
+.cache/
+.pytest_cache/
+cogniflex_cache/
+hybrid_cache/
+ml_cache/
+tokenizer_cache/
+ethics_cache/
+cogniflex_gui_cache/
+
+# Test artifacts (not test source files)
+test_*.txt
+test_*.pt
+test_*.safetensors
+test_model.pt
+
+# Documentation
+documentation/docs/chat_logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.npy
+temp/
+tmp/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Build artifacts (keep .spec files for PyInstaller builds)
+out/
+*.exe
+build/
+dist/
+
+# CogniFlex specific - caches & temp
+*.log
+logs/
+cogniflex_cache/
+cogniflex/__pycache__/
+cogniflex/**/__pycache__/
+cogniflex/core/cogniflex_cache/
+cogniflex/gui/cogniflex_gui_cache/
+cogniflex/knowledge/cogniflex_knowledge_cache/
+cogniflex/learning/cogniflex_self_analyzer_cache/
+cogniflex/mlearning/cogniflex_models/
+cogniflex/websearch/cogniflex_web_search_cache/
+cogniflex/nltk_data/
+analytics_cache/
+test_cache/
+recovery_checkpoints/
+fractal_storage/
+fractal_storage_clean/
+debug/
+debug_export_output/
+models/
+text-generation/
+cache/
+ml_cache/
+benchmark_cache/
+backup_*/
+contradiction_cache/
+nltk_data/
+
+# Model files
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.h5
+model.safetensors
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Windows specific
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Local virtualenvs and backups
+.venv311_backup/
+*.backup/
+
+# Training data and outputs
+training_output/
+checkpoints/
+fractal_unified_text-generation/
+
+# GUI state / runtime caches
+cogniflex/gui/memory_cache/
+cogniflex/core/cogniflex_cache/autopilot/
+
+# Misc runtime artefacts
+cogniflex.log
+run.log
+
+# Development fix scripts (root only)
+/fix_*.py
+/update_*.py
+/add_*.py
+nul
+fractal_models/
+
+# Archives of moved/old files
+_archive/
+
+# Colab artifacts
+lambda_colab.zip
+generation_sample.txt
+
+# Generated outputs (analytics, test output, reports)
+outputs/
+
+# GGUF models (large binary files)
+*.gguf
+gguf_models/
+eva/mlearning/eva_models/
+
+# EVA specific caches and runtime data
+eva/core/eva_cache/
+eva/gui/eva_config.json
+eva/gui/eva_gui_cache/
+eva/websearch/eva_web_search_cache/
+eva/memory/fractal_torch_storage/unified_memory/
+stable_branch/
+eva_ai/gui/eva_gui_cache/sessions.json
